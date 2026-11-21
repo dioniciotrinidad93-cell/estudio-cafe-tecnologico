@@ -1,1 +1,1 @@
-Primera versión de prueba: menú, canales de la comunidad, buscar actualizaciones y voz del asistente.
+Versión 0.2: ya funcionan todas las pantallas. Mezclar audio con música de fondo (volúmenes, vista previa, duración distinta, M4A o WAV) y crear video con audio e imágenes (varias imágenes, orden, duración, tamaño y encuadre, MP4). Asistente con voz del sistema a tu elección y velocidad ajustable, advertencia previa, y modo manual o con asistente. Enlaces de la comunidad.
