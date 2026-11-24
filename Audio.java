@@ -26,6 +26,7 @@ import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
+import java.nio.charset.StandardCharsets;
 import java.nio.ShortBuffer;
 import java.util.Arrays;
 
@@ -672,6 +673,95 @@ final class Audio {
         }
     }
 
+    // ---------- Sonido de transición entre imágenes ----------
+
+    static final String[] NOMBRES_TRANSICION = {"Campanita suave", "Clic corto", "Dos tonos"};
+
+    /** Genera con código el sonido de transición: estéreo, a 44100 Hz, sin volumen aplicado. */
+    static short[] sonidoTransicion(int tipo) {
+        double dur = tipo == 1 ? 0.12 : (tipo == 2 ? 0.40 : 0.60);
+        int n = (int) (dur * HZ);
+        short[] r = new short[n * 2];
+        for (int i = 0; i < n; i++) {
+            double t = i / (double) HZ;
+            double v;
+            if (tipo == 1) {
+                v = Math.sin(2 * Math.PI * 1600 * t) * Math.exp(-t * 45);
+            } else if (tipo == 2) {
+                if (t < 0.15) {
+                    v = Math.sin(2 * Math.PI * 660 * t) * Math.exp(-t * 9);
+                } else {
+                    double u = t - 0.15;
+                    v = Math.sin(2 * Math.PI * 880 * u) * Math.exp(-u * 9);
+                }
+            } else {
+                v = (Math.sin(2 * Math.PI * 1046.5 * t) * 0.7
+                        + Math.sin(2 * Math.PI * 2093.0 * t) * 0.25
+                        + Math.sin(2 * Math.PI * 2637.0 * t) * 0.1) * Math.exp(-t * 6.5);
+            }
+            if (t < 0.004) v *= t / 0.004;
+            int resto = n - i;
+            if (resto < 441) v *= resto / 441.0;
+            short s = (short) Math.round(v * 0.8 * 32767);
+            r[2 * i] = s;
+            r[2 * i + 1] = s;
+        }
+        return r;
+    }
+
+    /**
+     * Copia el audio de trabajo sumando el sonido de transición en cada momento (en segundos).
+     * El volumen va de 0 a 100.
+     */
+    static void agregarTransiciones(File entrada, File salida, double[] segundos, int tipo,
+            int volPct, Progreso prog, Cancelado can) throws Exception {
+        final short[] cue = sonidoTransicion(tipo);
+        final int cl = cue.length / 2;
+        final double g = volPct / 100.0;
+        final long[] pos = new long[segundos.length];
+        for (int i = 0; i < pos.length; i++) pos[i] = Math.round(segundos[i] * HZ);
+        final int bloque = 8192;
+        short[] b = new short[bloque * 2];
+        byte[] bytes = new byte[bloque * 4];
+        try (Lector l = new Lector(entrada);
+                OutputStream os = new BufferedOutputStream(new FileOutputStream(salida), 1 << 16)) {
+            long total = l.marcos;
+            long p = 0;
+            int ultimoPct = -1;
+            while (p < total) {
+                if (can != null && can.si()) throw new Cancelacion();
+                int n = l.leer(b, 0, (int) Math.min(bloque, total - p));
+                if (n <= 0) break;
+                for (long c : pos) {
+                    if (c >= p + n || c + cl <= p) continue;
+                    long ini = Math.max(c, p);
+                    long fin = Math.min(c + cl, p + n);
+                    for (long q = ini; q < fin; q++) {
+                        int i = (int) (q - p);
+                        int k = (int) (q - c);
+                        for (int ch = 0; ch < 2; ch++) {
+                            long v = Math.round(b[2 * i + ch] + cue[2 * k + ch] * g);
+                            if (v > 32767) v = 32767;
+                            if (v < -32768) v = -32768;
+                            b[2 * i + ch] = (short) v;
+                        }
+                    }
+                }
+                aBytes(b, n, bytes);
+                os.write(bytes, 0, n * 4);
+                p += n;
+                if (prog != null && total > 0) {
+                    int pct = (int) Math.min(100, p * 100 / total);
+                    if (pct != ultimoPct) {
+                        ultimoPct = pct;
+                        prog.porcentaje(pct);
+                    }
+                }
+            }
+        }
+        if (prog != null) prog.porcentaje(100);
+    }
+
     // ---------- Guardar en el teléfono ----------
 
     static final String CARPETA = "Estudio Cafe Tecnologico";
@@ -713,6 +803,47 @@ final class Audio {
             throw e;
         }
         return uri;
+    }
+
+    /** Guarda un texto como archivo TXT en Documentos y devuelve su dirección. */
+    static Uri guardarTexto(Context c, String texto, String nombre) throws Exception {
+        ContentResolver cr = c.getContentResolver();
+        ContentValues v = new ContentValues();
+        v.put(MediaStore.MediaColumns.DISPLAY_NAME, nombre);
+        v.put(MediaStore.MediaColumns.MIME_TYPE, "text/plain");
+        v.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOCUMENTS + "/" + CARPETA);
+        v.put(MediaStore.MediaColumns.IS_PENDING, 1);
+        Uri uri = cr.insert(MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), v);
+        if (uri == null) {
+            throw new Exception("No pude crear el archivo en el almacenamiento del teléfono.");
+        }
+        try {
+            OutputStream os = cr.openOutputStream(uri);
+            if (os == null) throw new Exception("No pude abrir el archivo para guardarlo.");
+            try (OutputStream o = os) {
+                o.write(texto.getBytes(StandardCharsets.UTF_8));
+            }
+            ContentValues fin = new ContentValues();
+            fin.put(MediaStore.MediaColumns.IS_PENDING, 0);
+            cr.update(uri, fin, null, null);
+        } catch (Exception e) {
+            try {
+                cr.delete(uri, null, null);
+            } catch (Exception ignorada) {
+                // nada
+            }
+            throw e;
+        }
+        return uri;
+    }
+
+    /** Cambia el contenido de un TXT ya guardado. */
+    static void reescribirTexto(Context c, Uri uri, String texto) throws Exception {
+        OutputStream os = c.getContentResolver().openOutputStream(uri, "wt");
+        if (os == null) throw new Exception("No pude abrir el archivo para guardar los cambios.");
+        try (OutputStream o = os) {
+            o.write(texto.getBytes(StandardCharsets.UTF_8));
+        }
     }
 
     /** El nombre con el que quedó guardado el archivo (el sistema lo cambia si ya existía). */

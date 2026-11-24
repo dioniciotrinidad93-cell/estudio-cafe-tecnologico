@@ -14,6 +14,7 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.PowerManager;
 import android.provider.OpenableColumns;
+import android.text.InputType;
 import android.speech.tts.TextToSpeech;
 import android.view.View;
 import android.view.ViewGroup;
@@ -26,28 +27,34 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.text.DateFormat;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Date;
 import java.util.List;
+import java.util.Locale;
 import java.util.function.Consumer;
 import java.util.function.IntConsumer;
 import java.util.function.IntSupplier;
 import java.util.function.LongConsumer;
 
 /**
- * Estudio Café Tecnológico, versión 0.2.
+ * Estudio Café Tecnológico, versión 0.3.
  * Interfaz hecha por código, pensada para lectores de pantalla (TalkBack, Jieshuo, Prudence):
  * solo botones y textos claros, sin iconos ni gestos de arrastrar.
  *
- * Funciones: mezclar audio con música de fondo y crear un video con audio e imágenes. Cada una
- * puede usarse con el asistente (pasos guiados y voz del teléfono) o en modo manual.
+ * Funciones: mezclar audio con música de fondo, crear un video con audio e imágenes (con zoom,
+ * descripción de las imágenes, sonido de transición y proyectos guardados) y transcribir audios a
+ * texto. Cada una puede usarse con el asistente (pasos guiados y voz del teléfono) o en modo manual.
  */
 public class MainActivity extends Activity {
 
@@ -67,6 +74,7 @@ public class MainActivity extends Activity {
     private static final int PEDIDO_MUSICA = 2;
     private static final int PEDIDO_AUDIO_VIDEO = 3;
     private static final int PEDIDO_IMAGENES = 4;
+    private static final int PEDIDO_TRANSCRIPCION = 5;
 
     private ScrollView scroll;
     private LinearLayout contenido;
@@ -117,6 +125,26 @@ public class MainActivity extends Activity {
     private String vdNombreSalida = "Video con audio";
     private Uri ultimaMezclaUri;
     private String ultimaMezclaNombre;
+
+    // Estado del video, versión 0.3
+    private Uri vdAudioUri;
+    private boolean vdTrans = false;
+    private int vdTransTipo = 0;
+    private int vdTransVol = 40;
+    private int vdZoomGlobal = 0;
+    private String vdProyecto = "";
+
+    // Estado de la transcripción
+    private String trNombre;
+    private File trPcm;
+    private long trMarcos;
+    private int trIdioma = 0;
+    private boolean trHablantes = false;
+    private String trNombreSalida = "Transcripción";
+    private final StringBuilder trParcial = new StringBuilder();
+    private String trFalla;
+    private String trTexto;
+    private Uri trArchivo;
 
     // ---------- Ciclo de vida ----------
 
@@ -295,7 +323,8 @@ public class MainActivity extends Activity {
         if (l == null) return;
         for (File f : l) {
             String n = f.getName();
-            if (n.endsWith(".pcm") || n.endsWith(".m4a") || n.endsWith(".wav") || n.endsWith(".mp4")) {
+            if (n.endsWith(".pcm") || n.endsWith(".m4a") || n.endsWith(".wav") || n.endsWith(".mp4")
+                    || n.endsWith(".aac")) {
                 f.delete();
             }
         }
@@ -602,10 +631,14 @@ public class MainActivity extends Activity {
     private void mostrarMenu() {
         nuevaPantalla("Estudio Café Tecnológico", null);
         texto("Edita audio y video con un asistente que te guía paso a paso, o por tu cuenta en "
-                + "modo manual. Gratuito y de código abierto.");
+                + "modo manual. Gratuito y de código abierto. Las funciones con Gemini usan tu propia "
+                + "clave gratuita de Google.");
         texto("Modo actual: " + (asistente() ? "con asistente" : "manual, sin asistente") + ".");
         boton("Mezclar audio con música de fondo", () -> entrar(this::mzInicio, this::mzManual));
         boton("Crear video con audio e imágenes", () -> entrar(this::vdInicio, this::vdManual));
+        boton("Transcribir un audio a texto", () -> entrar(this::trInicio, this::trManual));
+        boton("Proyectos de video guardados", this::mostrarProyectos);
+        boton("Clave de Gemini", () -> mostrarClave(this::mostrarMenu, this::mostrarMenu));
         boton("Asistente y voz", this::mostrarAsistente);
         boton("Nuestros canales", this::mostrarCanales);
         boton("Buscar actualizaciones", this::buscarActualizaciones);
@@ -1180,6 +1213,7 @@ public class MainActivity extends Activity {
     }
 
     private void vdUsarAudioExistente(final Uri u, final String nombre) {
+        vdAudioUri = u;
         vdAudioPcm = null;
         final File pcm = cache("video_audio.pcm");
         prepararAudio(u, nombre, pcm, marcos -> {
@@ -1204,6 +1238,7 @@ public class MainActivity extends Activity {
                     final Uri u = uris.get(0);
                     final String nombre = nombreDe(u);
                     final File pcm = cache("video_audio.pcm");
+                    vdAudioUri = u;
                     vdAudioPcm = null;
                     prepararAudio(u, nombre, pcm, marcos -> {
                         vdAudioNombre = nombre;
@@ -1216,6 +1251,7 @@ public class MainActivity extends Activity {
             final Uri u = ultimaMezclaUri;
             final String nombre = ultimaMezclaNombre;
             boton("Usar la última mezcla: " + nombre, () -> {
+                vdAudioUri = u;
                 vdAudioPcm = null;
                 final File pcm = cache("video_audio.pcm");
                 prepararAudio(u, nombre, pcm, marcos -> {
@@ -1232,10 +1268,34 @@ public class MainActivity extends Activity {
         int n = vdImagenes.size();
         texto(n == 0 ? "Todavía no elegiste imágenes."
                 : "Tienes " + n + (n == 1 ? " imagen." : " imágenes.")
-                + " Toca una imagen para moverla, quitarla o cambiar su duración.");
+                + " Toca una imagen para moverla, quitarla, describirla o cambiar su duración y su zoom.");
         boton(n == 0 ? "Elegir imágenes" : "Agregar más imágenes", () ->
                 elegirArchivo(PEDIDO_IMAGENES, "image/*", true, uris -> vdAgregar(uris, refrescar)));
         vdListaImagenes(refrescar);
+        if (n > 0) {
+            encabezado("Descripción de las imágenes");
+            final List<Integer> pendientes = new ArrayList<>();
+            for (int i = 0; i < n; i++) {
+                String d = vdImagenes.get(i).descripcion;
+                if (d == null || d.isEmpty()) pendientes.add(i);
+            }
+            int sin = pendientes.size();
+            texto("Gemini puede describirte cada imagen para que sepas qué fotos agregaste. "
+                    + (sin == 0 ? "Todas tienen descripción."
+                    : sin + (sin == 1 ? " imagen todavía no tiene descripción."
+                    : " imágenes todavía no tienen descripción.")));
+            ciclo("Nivel de detalle", new String[] {"Breve, una o dos frases", "Detallada"},
+                    () -> prefs.getInt("desc_detalle", 0),
+                    v -> prefs.edit().putInt("desc_detalle", v).apply());
+            ciclo("Idioma de la descripción", Gemini.NOMBRES_IDIOMA_DESCRIPCION,
+                    () -> prefs.getInt("desc_idioma", 0),
+                    v -> prefs.edit().putInt("desc_idioma", v).apply());
+            if (sin > 0) {
+                boton(sin == 1 ? "Describir la imagen sin descripción"
+                        : "Describir las " + sin + " imágenes sin descripción",
+                        () -> vdDescribir(pendientes, refrescar, refrescar));
+            }
+        }
     }
 
     private void vdListaImagenes(final Runnable refrescar) {
@@ -1248,10 +1308,70 @@ public class MainActivity extends Activity {
                 int s = vdSegDe(i);
                 t += " Dura " + s + (s == 1 ? " segundo." : " segundos.");
             }
+            if (im.zoom == 1) t += " Zoom: acercar.";
+            else if (im.zoom == 2) t += " Zoom: alejar.";
+            if (im.descripcion != null && !im.descripcion.isEmpty()) t += " Tiene descripción.";
             String av = im.aviso();
             if (!av.isEmpty()) t += " Aviso: " + av;
             boton(t, () -> vdOpcionesImagen(idx, refrescar));
         }
+    }
+
+    // ----- Descripción de imágenes con Gemini -----
+
+    private void vdDescribir(final List<Integer> indices, final Runnable alTerminar,
+            final Runnable atras) {
+        final List<Video.Imagen> lista = new ArrayList<>();
+        for (int i : indices) lista.add(vdImagenes.get(i));
+        final Runnable seguir = () -> conClave(
+                () -> vdDescribirYa(lista, alTerminar, atras), atras);
+        if (prefs.getBoolean("aviso_img_ok", false)) {
+            seguir.run();
+            return;
+        }
+        nuevaPantalla("Antes de describir las imágenes", atras);
+        String t = "Para describirlas, la aplicación envía cada imagen a Gemini, de Google, con tu "
+                + "clave. Cada imagen usa una solicitud del cupo de tu clave. Con el nivel gratuito, "
+                + "Google puede usar lo que envías para mejorar sus productos, así que no envíes "
+                + "imágenes privadas o confidenciales. La descripción puede tener errores: "
+                + "revísala antes de confiar en ella.";
+        texto(t);
+        guia(t);
+        final boolean[] no = {false};
+        casilla("No volver a mostrar este aviso", false, m -> no[0] = m);
+        boton("Entendido, describir", () -> {
+            if (no[0]) prefs.edit().putBoolean("aviso_img_ok", true).apply();
+            seguir.run();
+        });
+        boton("Cancelar", atras);
+    }
+
+    private void vdDescribirYa(final List<Video.Imagen> lista, final Runnable alTerminar,
+            final Runnable atras) {
+        final String clave = claveGemini();
+        final int detalle = prefs.getInt("desc_detalle", 0);
+        final int idioma = prefs.getInt("desc_idioma", 0);
+        final int total = lista.size();
+        trabajar("Describiendo las imágenes",
+                "Estoy enviando " + (total == 1 ? "la imagen" : "las " + total + " imágenes")
+                        + " a Gemini, una por una. Mantén la aplicación abierta.",
+                (p, c) -> {
+                    String[] modelos = Gemini.orden(clave, true);
+                    int k = 0;
+                    for (Video.Imagen im : lista) {
+                        if (c.si()) throw new Audio.Cancelacion();
+                        im.descripcion = Gemini.describirImagen(this, im.uri, clave, modelos,
+                                detalle, idioma, c);
+                        k++;
+                        p.porcentaje(k * 100 / total);
+                    }
+                },
+                () -> {
+                    alTerminar.run();
+                    guia(total == 1 ? "Listo, la imagen ya tiene descripción."
+                            : "Listo, las " + total + " imágenes ya tienen descripción.");
+                },
+                atras);
     }
 
     private void vdAgregar(List<Uri> uris, final Runnable refrescar) {
@@ -1301,7 +1421,20 @@ public class MainActivity extends Activity {
             texto("Aviso: " + av + " Para que el video se vea nítido y las plataformas lo "
                     + "recomienden, usa imágenes enfocadas y grandes.");
         }
+        encabezado("Descripción");
+        final List<Integer> esta = new ArrayList<>();
+        esta.add(idx);
+        final Runnable aqui = () -> vdOpcionesImagen(idx, regreso);
+        if (im.descripcion != null && !im.descripcion.isEmpty()) {
+            texto(im.descripcion);
+            boton("Describir otra vez", () -> vdDescribir(esta, aqui, aqui));
+        } else {
+            boton("Describir esta imagen con Gemini", () -> vdDescribir(esta, aqui, aqui));
+        }
+        encabezado("Zoom");
+        ciclo("Zoom de esta imagen", Video.NOMBRES_ZOOM, () -> im.zoom, v -> im.zoom = v);
         if (vdPersonal) {
+            encabezado("Duración");
             final TextView t = texto("Duración de esta imagen: " + vdSegDe(idx) + " segundos.");
             t.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
             final int[] pasos = {-10, -1, 1, 10};
@@ -1315,6 +1448,7 @@ public class MainActivity extends Activity {
                 });
             }
         }
+        encabezado("Orden");
         if (idx > 0) {
             boton("Mover esta imagen antes, a la posición " + idx, () -> {
                 vdImagenes.remove(idx);
@@ -1359,15 +1493,86 @@ public class MainActivity extends Activity {
         }
     }
 
+    private void vdBloqueEfectos(final Runnable refrescar) {
+        encabezado("Zoom");
+        texto("El zoom acerca o aleja suavemente la imagen hacia el centro mientras dura. Se crea "
+                + "con la mejor calidad posible, así que el video tarda bastante más en exportarse. "
+                + "También puedes poner el zoom a una sola imagen: tócala en la lista de imágenes.");
+        ciclo("Zoom en todas las imágenes", new String[] {"Sin zoom en ninguna",
+                "Acercar en todas", "Alejar en todas", "Alternar: acercar, alejar, acercar..."},
+                () -> vdZoomGlobal, v -> {
+                    vdZoomGlobal = v;
+                    for (int i = 0; i < vdImagenes.size(); i++) {
+                        vdImagenes.get(i).zoom = v == 0 ? 0 : (v == 1 ? 1 : (v == 2 ? 2
+                                : (i % 2 == 0 ? 1 : 2)));
+                    }
+                });
+        encabezado("Sonido de transición");
+        texto("Un sonido corto y suave que suena cada vez que cambia la imagen, para saber el "
+                + "momento exacto del cambio. Se mezcla en el audio del video. Es opcional.");
+        casilla("Poner un sonido en cada cambio de imagen", vdTrans, m -> {
+            vdTrans = m;
+            refrescar.run();
+        });
+        if (vdTrans) {
+            ciclo("Sonido", Audio.NOMBRES_TRANSICION, () -> vdTransTipo, v -> vdTransTipo = v);
+            ajustador("Volumen del sonido de transición", () -> vdTransVol, " por ciento",
+                    "Bajar el volumen del sonido", "Subir el volumen del sonido",
+                    () -> vdTransVol = Math.max(10, vdTransVol - 10),
+                    () -> vdTransVol = Math.min(100, vdTransVol + 10), null);
+            boton("Escuchar el sonido de transición", () -> {
+                short[] c = Audio.sonidoTransicion(vdTransTipo);
+                double g = vdTransVol / 100.0;
+                for (int i = 0; i < c.length; i++) c[i] = (short) Math.round(c[i] * g);
+                reproducir(c, () -> { });
+            });
+            if (vdImagenes.size() < 2) {
+                texto("Con una sola imagen no hay cambios, así que el sonido no se oirá.");
+            }
+        }
+    }
+
     private void vdBloqueExportar(final Runnable volverAqui) {
         int n = vdImagenes.size();
-        texto("Se creará un video de " + textoDuracion(Math.round(vdTotalSeg())) + " con " + n
-                + (n == 1 ? " imagen" : " imágenes") + ". Puede tardar varios minutos si el audio es largo.");
+        String t = "Se creará un video de " + textoDuracion(Math.round(vdTotalSeg())) + " con " + n
+                + (n == 1 ? " imagen" : " imágenes") + ". Puede tardar varios minutos si el audio es largo.";
+        if (Video.hayZoom(vdImagenes)) {
+            t += " Como hay zoom, el video se crea cuadro por cuadro con la mejor calidad y tarda "
+                    + "mucho más: puede tardar tanto como lo que dura el video, o más, según tu "
+                    + "teléfono. Conéctalo a la corriente y no cierres la aplicación.";
+        }
+        texto(t);
         final EditText nombre = campoNombre("Nombre del archivo", vdNombreSalida);
         boton("Crear el video", () -> {
             vdNombreSalida = nombre.getText().toString();
             vdExportar(volverAqui);
         });
+        vdBloqueProyecto();
+    }
+
+    private void vdBloqueProyecto() {
+        encabezado("Proyecto");
+        texto(vdProyecto.isEmpty()
+                ? "Guarda este trabajo como proyecto para seguirlo después sin volver a elegir todo."
+                : "Proyecto actual: " + vdProyecto + ".");
+        final EditText nombre = campoNombre("Nombre del proyecto",
+                vdProyecto.isEmpty() ? "Mi proyecto de video" : vdProyecto);
+        final TextView estado = texto("");
+        estado.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        boton("Guardar el proyecto", () -> guardarProyecto(nombre.getText().toString(), estado));
+    }
+
+    /** Los momentos, en segundos, en que cambia la imagen. */
+    private static double[] momentosDeCambio(double[] dur, double total) {
+        double[] m = new double[Math.max(0, dur.length - 1)];
+        double acum = 0;
+        int k = 0;
+        for (int i = 0; i < dur.length - 1; i++) {
+            acum += dur[i];
+            if (acum >= total) break;
+            m[k++] = acum;
+        }
+        return Arrays.copyOf(m, k);
     }
 
     private void vdExportar(final Runnable volverAqui) {
@@ -1377,24 +1582,38 @@ public class MainActivity extends Activity {
         final double[] dur = vdDuraciones();
         final int formato = vdFormato;
         final int encuadre = vdEncuadre;
+        final boolean trans = vdTrans && imagenes.size() > 1;
+        final int tipo = vdTransTipo;
+        final int vol = vdTransVol;
         final String nombre = nombreArchivo(vdNombreSalida, "Video con audio") + ".mp4";
+        final File conSonido = cache("video_audio_t.pcm");
         final File m4a = cache("video_audio.m4a");
         final File solo = cache("video_solo.mp4");
         final File fin = cache("video_final.mp4");
         final Uri[] resultado = new Uri[1];
+        final boolean largo = Video.hayZoom(imagenes);
         trabajar("Creando el video",
-                "Estoy creando tu video. Puede tardar varios minutos. Mantén la aplicación abierta.",
+                "Estoy creando tu video. Puede tardar " + (largo ? "mucho" : "varios minutos")
+                        + ". Mantén la aplicación abierta.",
                 (p, c) -> {
                     try {
                         m4a.delete();
                         solo.delete();
                         fin.delete();
-                        Audio.pcmAM4a(audio, m4a, escalar(p, 0, 8), c);
+                        File origen = audio;
+                        if (trans) {
+                            conSonido.delete();
+                            Audio.agregarTransiciones(audio, conSonido,
+                                    momentosDeCambio(dur, total), tipo, vol, escalar(p, 0, 4), c);
+                            origen = conSonido;
+                        }
+                        Audio.pcmAM4a(origen, m4a, escalar(p, trans ? 4 : 0, 8), c);
                         Video.crear(this, imagenes, dur, m4a, total, formato, encuadre, fin, solo,
                                 escalar(p, 8, 98), c);
                         resultado[0] = Audio.guardar(this, fin, nombre, "video/mp4", true);
                         p.porcentaje(100);
                     } finally {
+                        conSonido.delete();
                         m4a.delete();
                         solo.delete();
                         fin.delete();
@@ -1415,6 +1634,8 @@ public class MainActivity extends Activity {
         boton("Crear otro video", () -> {
             vdImagenes.clear();
             vdPersonal = false;
+            vdProyecto = "";
+            vdZoomGlobal = 0;
             empezar(this::vdInicio, this::vdManual);
         });
         boton("Volver al menú", this::mostrarMenu);
@@ -1425,11 +1646,13 @@ public class MainActivity extends Activity {
     private void vdInicio() {
         nuevaPantalla("Crear video con audio e imágenes", this::mostrarMenu);
         String t = "Vamos a crear un video con tu audio y una o varias imágenes. Te guiaré paso a "
-                + "paso: elegir el audio, elegir las imágenes, el tamaño y el encuadre, cuánto dura "
-                + "cada imagen, y exportar el video.";
+                + "paso: elegir el audio, elegir las imágenes (y describirlas si quieres), el tamaño "
+                + "y el encuadre, cuánto dura cada imagen, el zoom y el sonido de transición, y "
+                + "exportar el video.";
         texto(t);
         guia(t);
         boton("Comenzar", this::vdPasoAudio);
+        boton("Abrir un proyecto guardado", this::mostrarProyectos);
         boton("Volver al menú", this::mostrarMenu);
     }
 
@@ -1448,7 +1671,8 @@ public class MainActivity extends Activity {
         nuevaPantalla("Paso 2: las imágenes", this::vdPasoAudio);
         String t = "Elige una o varias imágenes. Aparecerán en el orden de la lista. Reviso el tamaño y "
                 + "el enfoque de cada una, porque una imagen borrosa o pequeña hace que el video se "
-                + "vea mal y las plataformas lo recomienden menos.";
+                + "vea mal y las plataformas lo recomienden menos. Si quieres, Gemini te describe "
+                + "cada imagen para que sepas qué fotos agregaste.";
         texto(t);
         guia(t);
         vdBloqueImagenes(this::vdPasoImagenes);
@@ -1474,17 +1698,29 @@ public class MainActivity extends Activity {
         texto(t);
         guia(t);
         vdBloqueDuracion(this::vdPasoDuracion);
-        boton("Siguiente: crear el video", this::vdPasoExportar);
+        boton("Siguiente: zoom y sonido de transición", this::vdPasoEfectos);
         boton("Atrás", this::vdPasoFormato);
     }
 
+    private void vdPasoEfectos() {
+        nuevaPantalla("Paso 5: zoom y sonido de transición", this::vdPasoDuracion);
+        String t = "Dos adornos opcionales. El zoom da movimiento a las imágenes. El sonido de "
+                + "transición marca el momento exacto en que pasa de una imagen a la siguiente.";
+        texto(t);
+        guia(t);
+        vdBloqueEfectos(this::vdPasoEfectos);
+        boton("Siguiente: crear el video", this::vdPasoExportar);
+        boton("Atrás", this::vdPasoDuracion);
+    }
+
     private void vdPasoExportar() {
-        nuevaPantalla("Paso 5: crear el video", this::vdPasoDuracion);
-        String t = "Último paso. Elige el nombre del archivo y crea el video.";
+        nuevaPantalla("Paso 6: crear el video", this::vdPasoEfectos);
+        String t = "Último paso. Elige el nombre del archivo y crea el video. También puedes guardar "
+                + "el trabajo como proyecto.";
         texto(t);
         guia(t);
         vdBloqueExportar(this::vdPasoExportar);
-        boton("Atrás", this::vdPasoDuracion);
+        boton("Atrás", this::vdPasoEfectos);
     }
 
     // ----- Modo manual -----
@@ -1498,6 +1734,7 @@ public class MainActivity extends Activity {
         vdBloqueImagenes(this::vdManual);
         if (vdAudioPcm == null || vdImagenes.isEmpty()) {
             texto("Cuando elijas el audio y al menos una imagen, aparecerán los demás ajustes.");
+            boton("Abrir un proyecto guardado", this::mostrarProyectos);
             boton("Volver al menú", this::mostrarMenu);
             return;
         }
@@ -1505,9 +1742,528 @@ public class MainActivity extends Activity {
         vdBloqueFormato();
         encabezado("Duración de las imágenes");
         vdBloqueDuracion(this::vdManual);
+        vdBloqueEfectos(this::vdManual);
         encabezado("Crear el video");
         vdBloqueExportar(this::vdManual);
         boton("Volver al menú", this::mostrarMenu);
+    }
+
+    // =====================================================================
+    // CLAVE DE GEMINI
+    // =====================================================================
+
+    private String claveGemini() {
+        String c = prefs.getString("gm_clave", "");
+        return c == null ? "" : c.trim();
+    }
+
+    /** Sigue con siguiente si ya hay clave guardada; si no, la pide primero. */
+    private void conClave(Runnable siguiente, Runnable atras) {
+        if (claveGemini().isEmpty()) mostrarClave(siguiente, atras);
+        else siguiente.run();
+    }
+
+    private void claveBloque(Runnable refrescar) {
+        String c = claveGemini();
+        if (c.isEmpty()) {
+            texto("Todavía no has puesto tu clave de Gemini.");
+        } else {
+            texto("Clave de Gemini guardada. Termina en " + c.substring(Math.max(0, c.length() - 4))
+                    + ".");
+        }
+        boton(c.isEmpty() ? "Poner mi clave de Gemini" : "Cambiar mi clave de Gemini",
+                () -> mostrarClave(refrescar, refrescar));
+    }
+
+    private void mostrarClave(final Runnable alGuardar, final Runnable atras) {
+        nuevaPantalla("Clave de Gemini", atras);
+        String t = "Para transcribir audios y describir imágenes, la aplicación usa Gemini, de Google, "
+                + "con tu propia clave gratuita. La clave se guarda solo en este teléfono y se envía "
+                + "únicamente a Google. Puedes conseguirla gratis con tu cuenta de Google.";
+        texto(t);
+        guia(t);
+        final String actual = claveGemini();
+        if (!actual.isEmpty()) {
+            texto("Ya hay una clave guardada que termina en "
+                    + actual.substring(Math.max(0, actual.length() - 4))
+                    + ". Si escribes otra, reemplaza a la anterior.");
+        }
+        final EditText campo = campoNombre("Escribe o pega tu clave de Gemini", "");
+        campo.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
+        final TextView estado = texto("");
+        estado.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        boton("Guardar la clave", () -> {
+            String k = campo.getText().toString().trim();
+            if (k.length() < 20 || k.contains(" ")) {
+                estado.setText("La clave parece incompleta. Pégala completa, sin espacios.");
+                return;
+            }
+            prefs.edit().putString("gm_clave", k).apply();
+            Gemini.olvidar();
+            aviso("Clave guardada.");
+            alGuardar.run();
+        });
+        boton("Probar la clave", () -> {
+            String escrita = campo.getText().toString().trim();
+            final String k = escrita.isEmpty() ? actual : escrita;
+            if (k.isEmpty()) {
+                estado.setText("Primero escribe tu clave.");
+                return;
+            }
+            estado.setText("Probando la clave, un momento.");
+            final int id = pantallaId;
+            new Thread(() -> {
+                String r;
+                try {
+                    String[] m = Gemini.modelos(k);
+                    r = "La clave funciona. Usaré los modelos " + m[0] + " y " + m[1] + ".";
+                } catch (Exception e) {
+                    r = textoError(e);
+                }
+                final String res = r;
+                runOnUiThread(() -> {
+                    if (id == pantallaId) estado.setText(res);
+                });
+            }).start();
+        });
+        if (!actual.isEmpty()) {
+            boton("Borrar la clave guardada", () -> {
+                prefs.edit().remove("gm_clave").apply();
+                Gemini.olvidar();
+                mostrarClave(alGuardar, atras);
+            });
+        }
+        boton("Cómo conseguir una clave gratis", () -> abrir(Gemini.URL_CLAVE));
+        boton("Volver", atras);
+    }
+
+    // =====================================================================
+    // TRANSCRIBIR UN AUDIO A TEXTO
+    // =====================================================================
+
+    private void trReiniciar() {
+        trPcm = null;
+        trNombre = null;
+        trTexto = null;
+        trArchivo = null;
+        trFalla = null;
+        trParcial.setLength(0);
+        trNombreSalida = "Transcripción";
+        limpiarCache();
+    }
+
+    private void trBloqueAudio(final Runnable refrescar) {
+        boolean hay = trPcm != null;
+        if (hay) {
+            texto("Audio: " + trNombre + ". Dura " + duracion(trMarcos) + ".");
+        } else {
+            texto("Todavía no elegiste el audio.");
+        }
+        boton(hay ? "Cambiar el audio" : "Elegir el audio", () ->
+                elegirArchivo(PEDIDO_TRANSCRIPCION, "audio/*", false, uris -> {
+                    final Uri u = uris.get(0);
+                    final String nombre = nombreDe(u);
+                    final File pcm = cache("trans_audio.pcm");
+                    trPcm = null;
+                    prepararAudio(u, nombre, pcm, marcos -> {
+                        trNombre = nombre;
+                        trPcm = pcm;
+                        trMarcos = marcos;
+                        int punto = nombre.lastIndexOf('.');
+                        String base = punto > 0 ? nombre.substring(0, punto) : nombre;
+                        trNombreSalida = base + " - transcripción";
+                        refrescar.run();
+                    }, refrescar);
+                }));
+    }
+
+    private void trBloqueOpciones() {
+        ciclo("Idioma del audio", Transcribir.IDIOMAS, () -> trIdioma, v -> trIdioma = v);
+        casilla("Marcar quién habla cuando cambie la persona (Hablante 1, Hablante 2...)",
+                trHablantes, m -> trHablantes = m);
+    }
+
+    private String trTextoAviso() {
+        long seg = trMarcos / Audio.HZ;
+        int partes = Transcribir.partesDe(seg);
+        return "Tu audio dura " + textoDuracion(seg) + ". Se enviará a Gemini, de Google, con tu "
+                + "clave, en " + partes + (partes == 1 ? " parte" : " partes de unos 10 minutos")
+                + ". Cada parte usa una solicitud del cupo de tu clave. Con el nivel gratuito, Google "
+                + "puede usar lo que envías para mejorar sus productos, así que no transcribas audios "
+                + "privados o confidenciales. La transcripción puede tener errores: revísala. Si "
+                + "marcas a los hablantes, los números pueden cambiar de una parte a otra.";
+    }
+
+    private void trBloqueEjecutar(final Runnable volverAqui) {
+        if (trMarcos / Audio.HZ > Transcribir.MAX_SEG) {
+            texto("Este audio es demasiado largo. Puedo transcribir hasta "
+                    + textoDuracion(Transcribir.MAX_SEG) + ". Elige uno más corto.");
+            return;
+        }
+        final EditText nombre = campoNombre("Nombre del archivo de texto", trNombreSalida);
+        boton("Transcribir y guardar", () -> {
+            trNombreSalida = nombre.getText().toString();
+            conClave(() -> trTranscribir(volverAqui), volverAqui);
+        });
+    }
+
+    private void trTranscribir(final Runnable volverAqui) {
+        final File pcm = trPcm;
+        final File mono = cache("trans_16k.pcm");
+        final String clave = claveGemini();
+        final int idioma = trIdioma;
+        final boolean hablantes = trHablantes;
+        final String nombre = nombreArchivo(trNombreSalida, "Transcripción") + ".txt";
+        trParcial.setLength(0);
+        trFalla = null;
+        trTexto = null;
+        trArchivo = null;
+        trabajar("Transcribiendo el audio",
+                "Estoy enviando tu audio a Gemini por partes. Puede tardar varios minutos. "
+                        + "Mantén la aplicación abierta.",
+                (p, c) -> {
+                    try {
+                        String res;
+                        try {
+                            res = Transcribir.transcribir(pcm, mono, clave, idioma, hablantes, p, c,
+                                    trParcial);
+                        } catch (Audio.Cancelacion e) {
+                            throw e;
+                        } catch (Exception e) {
+                            if (trParcial.length() == 0) throw e;
+                            trFalla = textoError(e);
+                            res = trParcial.toString().trim();
+                        }
+                        trTexto = res;
+                        if (trFalla == null) trArchivo = Audio.guardarTexto(this, res, nombre);
+                    } finally {
+                        mono.delete();
+                    }
+                },
+                () -> trResultado(nombre), volverAqui);
+    }
+
+    private void trResultado(final String nombre) {
+        final String texto = trTexto == null ? "" : trTexto;
+        nuevaPantalla(trFalla == null ? "Transcripción lista" : "Transcripción incompleta",
+                this::mostrarMenu);
+        String t;
+        if (trFalla != null) {
+            t = "No pude terminar la transcripción. " + trFalla + " Esto es lo que alcancé a "
+                    + "transcribir. Puedes guardarlo como archivo de texto.";
+        } else {
+            String guardado = Audio.nombreGuardado(this, trArchivo, nombre);
+            String limpio = texto.trim();
+            int palabras = limpio.isEmpty() ? 0 : limpio.split("\\s+").length;
+            t = "Tu transcripción se guardó en la carpeta Documentos, dentro de la carpeta "
+                    + Audio.CARPETA + ", con el nombre " + guardado + ". Tiene " + palabras
+                    + " palabras.";
+        }
+        texto(t);
+        guia(trFalla == null ? "Listo. " + t : t);
+        final EditText cuerpo;
+        if (texto.length() <= 60000) {
+            TextView etiqueta = texto("Texto de la transcripción. Puedes corregirlo aquí.");
+            cuerpo = new EditText(this);
+            cuerpo.setId(View.generateViewId());
+            cuerpo.setText(texto);
+            cuerpo.setTextSize(18);
+            cuerpo.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
+            cuerpo.setMinLines(5);
+            etiqueta.setLabelFor(cuerpo.getId());
+            contenido.addView(cuerpo, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        } else {
+            cuerpo = null;
+            texto("El texto es muy largo para mostrarlo aquí. Ábrelo con tu aplicación de texto.");
+        }
+        final TextView estado = texto("");
+        estado.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        if (trArchivo != null) {
+            if (cuerpo != null) {
+                boton("Guardar los cambios", () -> {
+                    try {
+                        trTexto = cuerpo.getText().toString();
+                        Audio.reescribirTexto(this, trArchivo, trTexto);
+                        estado.setText("Cambios guardados.");
+                    } catch (Exception e) {
+                        estado.setText("No pude guardar los cambios. " + textoError(e));
+                    }
+                });
+            }
+            boton("Abrir el archivo de texto", () -> abrirArchivo(trArchivo, "text/plain"));
+            boton("Compartir el archivo de texto", () -> compartir(trArchivo, "text/plain"));
+        } else if (!texto.isEmpty()) {
+            boton("Guardar lo transcrito como archivo de texto", () -> {
+                try {
+                    String contenidoActual = cuerpo != null ? cuerpo.getText().toString() : trTexto;
+                    trArchivo = Audio.guardarTexto(this, contenidoActual, nombre);
+                    estado.setText("Guardado como " + Audio.nombreGuardado(this, trArchivo, nombre)
+                            + " en Documentos.");
+                } catch (Exception e) {
+                    estado.setText("No pude guardarlo. " + textoError(e));
+                }
+            });
+        }
+        boton("Transcribir otro audio", () -> {
+            trReiniciar();
+            empezar(this::trInicio, this::trManual);
+        });
+        boton("Volver al menú", this::mostrarMenu);
+    }
+
+    // ----- Pasos guiados -----
+
+    private void trInicio() {
+        nuevaPantalla("Transcribir un audio a texto", this::mostrarMenu);
+        String t = "Vamos a convertir un audio en texto con Gemini. Te guiaré paso a paso: elegir el "
+                + "audio, elegir el idioma, revisar el aviso y tu clave, y transcribir. El resultado "
+                + "es un archivo de texto que puedes corregir.";
+        texto(t);
+        guia(t);
+        boton("Comenzar", this::trPasoAudio);
+        boton("Volver al menú", this::mostrarMenu);
+    }
+
+    private void trPasoAudio() {
+        nuevaPantalla("Paso 1: el audio", this::trInicio);
+        String t = "Elige el audio que quieres transcribir. Puede ser una clase, una nota de voz o "
+                + "una grabación, en MP3, M4A, WAV u otros formatos.";
+        texto(t);
+        guia(t);
+        trBloqueAudio(this::trPasoAudio);
+        if (trPcm != null) boton("Siguiente: idioma y opciones", this::trPasoOpciones);
+        boton("Atrás", this::trInicio);
+    }
+
+    private void trPasoOpciones() {
+        nuevaPantalla("Paso 2: idioma y opciones", this::trPasoAudio);
+        String t = "Elige el idioma del audio, o deja que Gemini lo detecte. Si hay varias personas "
+                + "hablando, puedes pedir que se marque quién habla.";
+        texto(t);
+        guia(t);
+        trBloqueOpciones();
+        boton("Siguiente: aviso y clave", this::trPasoClave);
+        boton("Atrás", this::trPasoAudio);
+    }
+
+    private void trPasoClave() {
+        nuevaPantalla("Paso 3: aviso y clave", this::trPasoOpciones);
+        String t = trTextoAviso();
+        texto(t);
+        guia(t);
+        claveBloque(this::trPasoClave);
+        boton("Siguiente: transcribir", this::trPasoTranscribir);
+        boton("Atrás", this::trPasoOpciones);
+    }
+
+    private void trPasoTranscribir() {
+        nuevaPantalla("Paso 4: transcribir y guardar", this::trPasoClave);
+        String t = "Último paso. Elige el nombre del archivo de texto y empieza. Al terminar podrás "
+                + "leer el texto, corregirlo, abrirlo o compartirlo.";
+        texto(t);
+        guia(t);
+        trBloqueEjecutar(this::trPasoTranscribir);
+        boton("Atrás", this::trPasoClave);
+    }
+
+    // ----- Modo manual -----
+
+    private void trManual() {
+        nuevaPantalla("Transcribir audio, modo manual", this::mostrarMenu);
+        texto("En modo manual tienes todas las opciones en esta pantalla, sin pasos guiados.");
+        encabezado("Audio");
+        trBloqueAudio(this::trManual);
+        if (trPcm == null) {
+            texto("Cuando elijas el audio, aparecerán los demás ajustes.");
+            boton("Volver al menú", this::mostrarMenu);
+            return;
+        }
+        encabezado("Idioma y opciones");
+        trBloqueOpciones();
+        encabezado("Aviso y clave");
+        texto(trTextoAviso());
+        claveBloque(this::trManual);
+        encabezado("Transcribir");
+        trBloqueEjecutar(this::trManual);
+        boton("Volver al menú", this::mostrarMenu);
+    }
+
+    // =====================================================================
+    // PROYECTOS DE VIDEO
+    // =====================================================================
+
+    private void mostrarProyectos() {
+        nuevaPantalla("Proyectos de video guardados", this::mostrarMenu);
+        List<Proyectos.Item> lista = Proyectos.listar(this);
+        if (lista.isEmpty()) {
+            texto("Todavía no tienes proyectos guardados. Para guardar uno, prepara un video y usa "
+                    + "el botón Guardar el proyecto, en el último paso.");
+        } else {
+            texto("Tienes " + lista.size() + (lista.size() == 1 ? " proyecto." : " proyectos.")
+                    + " Toca uno para abrirlo o borrarlo.");
+            DateFormat df = DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT,
+                    new Locale("es"));
+            for (final Proyectos.Item it : lista) {
+                boton(it.nombre + ". Guardado el " + df.format(new Date(it.fecha)) + ".",
+                        () -> mostrarProyecto(it.nombre));
+            }
+        }
+        boton("Volver al menú", this::mostrarMenu);
+    }
+
+    private void mostrarProyecto(final String nombre) {
+        nuevaPantalla("Proyecto " + nombre, this::mostrarProyectos);
+        texto("Abrir el proyecto recupera el audio, las imágenes, el orden, las duraciones, el zoom, "
+                + "el sonido de transición, el formato y las descripciones.");
+        boton("Abrir este proyecto", () -> abrirProyecto(nombre));
+        boton("Borrar este proyecto", () -> confirmarBorrarProyecto(nombre));
+        boton("Volver a la lista", this::mostrarProyectos);
+    }
+
+    private void confirmarBorrarProyecto(final String nombre) {
+        nuevaPantalla("¿Borrar el proyecto?", () -> mostrarProyecto(nombre));
+        String t = "Vas a borrar el proyecto " + nombre + ". Tus imágenes y tu audio no se borran, "
+                + "solo el proyecto.";
+        texto(t);
+        guia(t);
+        boton("Sí, borrar el proyecto", () -> {
+            Proyectos.borrar(this, nombre);
+            if (nombre.equals(vdProyecto)) vdProyecto = "";
+            aviso("Proyecto borrado.");
+            mostrarProyectos();
+        });
+        boton("No, volver", () -> mostrarProyecto(nombre));
+    }
+
+    private void guardarProyecto(String deseado, TextView estado) {
+        String nombre = Proyectos.limpio(deseado);
+        if (nombre.isEmpty()) nombre = "Mi proyecto de video";
+        try {
+            JSONObject j = new JSONObject();
+            j.put("version", 1);
+            j.put("audioUri", vdAudioPcm != null && vdAudioUri != null ? vdAudioUri.toString() : "");
+            j.put("audioNombre", vdAudioNombre == null ? "" : vdAudioNombre);
+            j.put("formato", vdFormato);
+            j.put("encuadre", vdEncuadre);
+            j.put("personal", vdPersonal);
+            j.put("trans", vdTrans);
+            j.put("transTipo", vdTransTipo);
+            j.put("transVol", vdTransVol);
+            j.put("zoomGlobal", vdZoomGlobal);
+            j.put("nombreSalida", vdNombreSalida);
+            JSONArray a = new JSONArray();
+            for (Video.Imagen im : vdImagenes) {
+                JSONObject o = new JSONObject();
+                o.put("uri", im.uri.toString());
+                o.put("nombre", im.nombre);
+                o.put("ancho", im.ancho);
+                o.put("alto", im.alto);
+                o.put("nitidez", im.nitidez);
+                o.put("seg", im.seg);
+                o.put("zoom", im.zoom);
+                o.put("descripcion", im.descripcion == null ? "" : im.descripcion);
+                a.put(o);
+            }
+            j.put("imagenes", a);
+            boolean existia = Proyectos.existe(this, nombre);
+            Proyectos.guardar(this, nombre, j);
+            vdProyecto = nombre;
+            estado.setText((existia ? "Proyecto actualizado: " : "Proyecto guardado: ") + nombre + ".");
+        } catch (Exception e) {
+            estado.setText("No pude guardar el proyecto. " + textoError(e));
+        }
+    }
+
+    private boolean legible(Uri u) {
+        try (java.io.InputStream in = getContentResolver().openInputStream(u)) {
+            return in != null;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static int entre(int v, int min, int max) {
+        return Math.max(min, Math.min(max, v));
+    }
+
+    private void abrirProyecto(final String nombre) {
+        final int[] faltan = {0};
+        try {
+            JSONObject j = Proyectos.cargar(this, nombre);
+            List<Video.Imagen> nuevas = new ArrayList<>();
+            JSONArray a = j.getJSONArray("imagenes");
+            for (int i = 0; i < a.length(); i++) {
+                JSONObject o = a.getJSONObject(i);
+                Uri u = Uri.parse(o.getString("uri"));
+                if (!legible(u)) {
+                    faltan[0]++;
+                    continue;
+                }
+                Video.Imagen im = new Video.Imagen();
+                im.uri = u;
+                im.nombre = o.optString("nombre", "imagen");
+                im.ancho = o.optInt("ancho", 0);
+                im.alto = o.optInt("alto", 0);
+                im.nitidez = o.optDouble("nitidez", -1);
+                im.seg = entre(o.optInt("seg", 0), 0, 3600);
+                im.zoom = entre(o.optInt("zoom", 0), 0, 2);
+                im.descripcion = o.optString("descripcion", "");
+                nuevas.add(im);
+            }
+            vdImagenes.clear();
+            vdImagenes.addAll(nuevas);
+            vdFormato = entre(j.optInt("formato", 0), 0, Video.TAMANOS.length - 1);
+            vdEncuadre = entre(j.optInt("encuadre", 1), 0, Video.NOMBRES_ENCUADRE.length - 1);
+            vdPersonal = j.optBoolean("personal", false);
+            vdTrans = j.optBoolean("trans", false);
+            vdTransTipo = entre(j.optInt("transTipo", 0), 0, Audio.NOMBRES_TRANSICION.length - 1);
+            vdTransVol = entre(j.optInt("transVol", 40), 10, 100);
+            vdZoomGlobal = entre(j.optInt("zoomGlobal", 0), 0, 3);
+            vdNombreSalida = j.optString("nombreSalida", "Video con audio");
+            vdProyecto = nombre;
+            vdAudioPcm = null;
+            final String audioTxt = j.optString("audioUri", "");
+            final String audioNombre = j.optString("audioNombre", "audio");
+            Uri audio = audioTxt.isEmpty() ? null : Uri.parse(audioTxt);
+            if (audio != null && legible(audio)) {
+                final Uri audioUri = audio;
+                final File pcm = cache("video_audio.pcm");
+                vdAudioUri = audioUri;
+                prepararAudio(audioUri, audioNombre, pcm, marcos -> {
+                    vdAudioNombre = audioNombre;
+                    vdAudioPcm = pcm;
+                    vdAudioMarcos = marcos;
+                    proyectoAbierto(nombre, faltan[0], false);
+                }, this::mostrarMenu);
+            } else {
+                proyectoAbierto(nombre, faltan[0], true);
+            }
+        } catch (Exception e) {
+            aviso("No pude abrir el proyecto. " + textoError(e));
+        }
+    }
+
+    private void proyectoAbierto(String nombre, int imagenesFaltan, boolean sinAudio) {
+        StringBuilder m = new StringBuilder("Proyecto " + nombre + " abierto.");
+        if (sinAudio) m.append(" El audio ya no está disponible: elígelo otra vez.");
+        if (imagenesFaltan > 0) {
+            m.append(" ").append(imagenesFaltan)
+                    .append(imagenesFaltan == 1 ? " imagen ya no está disponible y se quitó."
+                            : " imágenes ya no están disponibles y se quitaron.");
+        }
+        final String mensaje = m.toString();
+        if (!asistente()) {
+            vdManual();
+        } else if (sinAudio) {
+            vdPasoAudio();
+        } else if (vdImagenes.isEmpty()) {
+            vdPasoImagenes();
+        } else {
+            vdPasoExportar();
+        }
+        aviso(mensaje);
+        guia(mensaje);
     }
 
     // =====================================================================

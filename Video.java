@@ -31,6 +31,16 @@ final class Video {
     private Video() {}
 
     static final int FPS = 5;
+    /** Cuadros por segundo cuando hay zoom: el movimiento necesita más cuadros para verse suave. */
+    static final int FPS_ZOOM = 24;
+    /** Cuánto crece la imagen con el zoom: 0.2 es un 20 por ciento. */
+    static final double ZOOM_MAX = 0.2;
+
+    static final String[] NOMBRES_ZOOM = {
+        "Sin zoom",
+        "Acercar suavemente hacia el centro",
+        "Alejar suavemente desde el centro"
+    };
 
     static final String[] NOMBRES_FORMATO = {
         "Horizontal 16 a 9, para YouTube",
@@ -53,6 +63,8 @@ final class Video {
         int alto;
         double nitidez;
         int seg; // duración en segundos si se personaliza
+        int zoom; // 0 sin zoom, 1 acercar, 2 alejar
+        String descripcion = ""; // descripción hecha con Gemini
 
         /** Aviso sobre la calidad de la imagen, o cadena vacía si se ve bien. */
         String aviso() {
@@ -189,39 +201,66 @@ final class Video {
 
     // ---------- Composición del cuadro ----------
 
-    private static void componer(Bitmap src, Bitmap dest, int w, int h, int modo) {
+    /** Prepara el fondo del cuadro: negro, o la imagen muy difuminada si el encuadre es el 1. */
+    private static void dibujarFondo(Bitmap src, Bitmap dest, int w, int h, int modo) {
         Canvas cv = new Canvas(dest);
         Paint pt = new Paint(Paint.FILTER_BITMAP_FLAG | Paint.ANTI_ALIAS_FLAG);
         cv.drawColor(Color.BLACK);
+        if (modo != 1) return;
         int sw = src.getWidth();
         int sh = src.getHeight();
-        if (modo == 0) {
-            float s = Math.max((float) w / sw, (float) h / sh);
-            float dw = sw * s;
-            float dh = sh * s;
-            cv.drawBitmap(src, null, new RectF((w - dw) / 2, (h - dh) / 2, (w + dw) / 2,
-                    (h + dh) / 2), pt);
-            return;
-        }
-        if (modo == 1) {
-            int pw = Math.max(8, w / 24);
-            int ph = Math.max(8, h / 24);
-            Bitmap peq = Bitmap.createBitmap(pw, ph, Bitmap.Config.ARGB_8888);
-            Canvas c2 = new Canvas(peq);
-            float s2 = Math.max((float) pw / sw, (float) ph / sh);
-            float dw2 = sw * s2;
-            float dh2 = sh * s2;
-            c2.drawBitmap(src, null, new RectF((pw - dw2) / 2, (ph - dh2) / 2, (pw + dw2) / 2,
-                    (ph + dh2) / 2), pt);
-            cv.drawBitmap(peq, null, new RectF(0, 0, w, h), pt);
-            peq.recycle();
-            cv.drawColor(Color.argb(110, 0, 0, 0));
-        }
-        float s = Math.min((float) w / sw, (float) h / sh);
-        float dw = sw * s;
-        float dh = sh * s;
+        int pw = Math.max(8, w / 24);
+        int ph = Math.max(8, h / 24);
+        Bitmap peq = Bitmap.createBitmap(pw, ph, Bitmap.Config.ARGB_8888);
+        Canvas c2 = new Canvas(peq);
+        float s2 = Math.max((float) pw / sw, (float) ph / sh);
+        float dw2 = sw * s2;
+        float dh2 = sh * s2;
+        c2.drawBitmap(src, null, new RectF((pw - dw2) / 2, (ph - dh2) / 2, (pw + dw2) / 2,
+                (ph + dh2) / 2), pt);
+        cv.drawBitmap(peq, null, new RectF(0, 0, w, h), pt);
+        peq.recycle();
+        cv.drawColor(Color.argb(110, 0, 0, 0));
+    }
+
+    /** Dibuja el cuadro: el fondo y la imagen encima, aumentada z veces desde el centro. */
+    private static void dibujarPrimerPlano(Bitmap src, Bitmap fondo, Bitmap dest, int w, int h,
+            int modo, float z) {
+        Canvas cv = new Canvas(dest);
+        Paint pt = new Paint(Paint.FILTER_BITMAP_FLAG | Paint.ANTI_ALIAS_FLAG);
+        cv.drawBitmap(fondo, 0, 0, null);
+        int sw = src.getWidth();
+        int sh = src.getHeight();
+        float s = modo == 0 ? Math.max((float) w / sw, (float) h / sh)
+                : Math.min((float) w / sw, (float) h / sh);
+        float dw = sw * s * z;
+        float dh = sh * s * z;
         cv.drawBitmap(src, null, new RectF((w - dw) / 2, (h - dh) / 2, (w + dw) / 2,
                 (h + dh) / 2), pt);
+    }
+
+    static boolean hayZoom(List<Imagen> imagenes) {
+        for (Imagen im : imagenes) {
+            if (im.zoom != 0) return true;
+        }
+        return false;
+    }
+
+    /** Una imagen en JPEG con el lado largo de a lo más maxLado, para mandarla a Gemini. */
+    static byte[] jpeg(Context c, Uri u, int maxLado) throws Exception {
+        Bitmap b = cargar(c, u, maxLado);
+        int mayor = Math.max(b.getWidth(), b.getHeight());
+        if (mayor > maxLado) {
+            float f = (float) maxLado / mayor;
+            Bitmap e = Bitmap.createScaledBitmap(b, Math.max(1, Math.round(b.getWidth() * f)),
+                    Math.max(1, Math.round(b.getHeight() * f)), true);
+            if (e != b) b.recycle();
+            b = e;
+        }
+        java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+        b.compress(Bitmap.CompressFormat.JPEG, 85, bo);
+        b.recycle();
+        return bo.toByteArray();
     }
 
     private static int limitar(int v, int min, int max) {
@@ -229,8 +268,7 @@ final class Video {
     }
 
     /** Pasa un cuadro ARGB a planos YUV 4:2:0 (BT.709, rango limitado). */
-    private static void aYuv(Bitmap b, int w, int h, byte[] y, byte[] u, byte[] v) {
-        int[] px = new int[w * h];
+    private static void aYuv(Bitmap b, int w, int h, int[] px, byte[] y, byte[] u, byte[] v) {
         b.getPixels(px, 0, w, 0, 0, w, h);
         for (int j = 0; j < h; j++) {
             int fila = j * w;
@@ -311,14 +349,17 @@ final class Video {
 
     /**
      * Crea el video. audioM4a es el audio ya codificado; durSeg trae la duración de cada imagen
-     * en segundos; totalSeg es lo que dura el audio (y el video).
+     * en segundos; totalSeg es lo que dura el audio (y el video). Si alguna imagen tiene zoom, todo
+     * el video se crea a más cuadros por segundo y con más calidad.
      */
     static void crear(Context c, List<Imagen> imagenes, double[] durSeg, File audioM4a,
             double totalSeg, int formato, int encuadre, File salida, File temporal,
             Audio.Progreso prog, Audio.Cancelado can) throws Exception {
         final int w = TAMANOS[formato][0];
         final int h = TAMANOS[formato][1];
-        final long totalMarcos = Math.max(1, Math.round(totalSeg * FPS));
+        final boolean conZoom = hayZoom(imagenes);
+        final int fps = conZoom ? FPS_ZOOM : FPS;
+        final long totalMarcos = Math.max(1, Math.round(totalSeg * fps));
         int cuantas = imagenes.size();
 
         // Hasta qué cuadro llega cada imagen.
@@ -326,17 +367,17 @@ final class Video {
         double acum = 0;
         for (int i = 0; i < cuantas; i++) {
             acum += durSeg[i];
-            fines[i] = Math.min(totalMarcos, Math.round(acum * FPS));
+            fines[i] = Math.min(totalMarcos, Math.round(acum * fps));
             if (i > 0 && fines[i] < fines[i - 1]) fines[i] = fines[i - 1];
         }
-        if (acum * FPS <= totalMarcos) fines[cuantas - 1] = totalMarcos;
+        if (acum * fps <= totalMarcos) fines[cuantas - 1] = totalMarcos;
 
         MediaFormat f = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h);
         f.setInteger(MediaFormat.KEY_COLOR_FORMAT,
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible);
-        f.setInteger(MediaFormat.KEY_BIT_RATE, 1000000);
-        f.setInteger(MediaFormat.KEY_FRAME_RATE, FPS);
-        f.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 5);
+        f.setInteger(MediaFormat.KEY_BIT_RATE, conZoom ? 3000000 : 1000000);
+        f.setInteger(MediaFormat.KEY_FRAME_RATE, fps);
+        f.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, conZoom ? 2 : 5);
         f.setInteger(MediaFormat.KEY_BITRATE_MODE,
                 MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR);
         f.setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709);
@@ -377,7 +418,9 @@ final class Video {
             byte[] yy = new byte[w * h];
             byte[] uu = new byte[w * h / 4];
             byte[] vv = new byte[w * h / 4];
+            int[] px = new int[w * h];
             Bitmap cuadro = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+            Bitmap fondo = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
             long cuadroActual = 0;
             int ultimoPct = -1;
             boolean eos = false;
@@ -386,26 +429,40 @@ final class Video {
                 long fin = fines[k];
                 if (fin <= cuadroActual) continue;
                 if (can != null && can.si()) throw new Audio.Cancelacion();
-                Bitmap src = cargar(c, imagenes.get(k).uri, Math.max(w, h));
-                componer(src, cuadro, w, h, encuadre);
-                src.recycle();
-                aYuv(cuadro, w, h, yy, uu, vv);
+                Imagen im = imagenes.get(k);
+                boolean zoomea = im.zoom != 0;
+                // Con zoom se carga la imagen más grande, para que al acercarla no se vea borrosa.
+                Bitmap src = cargar(c, im.uri, zoomea ? Math.max(w, h) * 3 / 2 : Math.max(w, h));
+                dibujarFondo(src, fondo, w, h, encuadre);
+                final long ini = cuadroActual;
+                final long cuantos = fin - ini;
+                if (!zoomea) {
+                    dibujarPrimerPlano(src, fondo, cuadro, w, h, encuadre, 1f);
+                    aYuv(cuadro, w, h, px, yy, uu, vv);
+                }
                 while (cuadroActual < fin) {
                     if (can != null && can.si()) throw new Audio.Cancelacion();
                     int i = enc.dequeueInputBuffer(10000);
                     if (i >= 0) {
-                        Image im = enc.getInputImage(i);
-                        if (im == null) {
+                        if (zoomea) {
+                            double t = cuantos <= 1 ? 0 : (cuadroActual - ini) / (double) (cuantos - 1);
+                            double s = t * t * (3 - 2 * t);
+                            double z = im.zoom == 1 ? 1 + ZOOM_MAX * s : 1 + ZOOM_MAX * (1 - s);
+                            dibujarPrimerPlano(src, fondo, cuadro, w, h, encuadre, (float) z);
+                            aYuv(cuadro, w, h, px, yy, uu, vv);
+                        }
+                        Image im2 = enc.getInputImage(i);
+                        if (im2 == null) {
                             throw new Exception("El codificador de video de este teléfono no "
                                     + "permite crear el video desde imágenes.");
                         }
-                        Image.Plane[] pl = im.getPlanes();
+                        Image.Plane[] pl = im2.getPlanes();
                         copiarPlano(pl[0], yy, w, h);
                         copiarPlano(pl[1], uu, w / 2, h / 2);
                         copiarPlano(pl[2], vv, w / 2, h / 2);
                         boolean ultimo = cuadroActual == totalMarcos - 1;
                         enc.queueInputBuffer(i, 0, w * h * 3 / 2,
-                                cuadroActual * 1000000L / FPS,
+                                cuadroActual * 1000000L / fps,
                                 ultimo ? MediaCodec.BUFFER_FLAG_END_OF_STREAM : 0);
                         cuadroActual++;
                     }
@@ -418,6 +475,7 @@ final class Video {
                         }
                     }
                 }
+                src.recycle();
             }
             if (cuadroActual < totalMarcos) {
                 throw new Exception("No pude completar el video. Revisa las imágenes elegidas.");
@@ -426,6 +484,7 @@ final class Video {
                 if (can != null && can.si()) throw new Audio.Cancelacion();
             }
             cuadro.recycle();
+            fondo.recycle();
             muxIniciado = est[1] == 1;
         } finally {
             if (enc != null) {
