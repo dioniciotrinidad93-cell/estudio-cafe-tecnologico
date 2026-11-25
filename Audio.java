@@ -330,6 +330,11 @@ final class Audio {
             blen = 0;
         }
 
+        /** El marco en que está la lectura. */
+        long posicion() {
+            return pos;
+        }
+
         /** Lee hasta n marcos estéreo en dst, desde el marco dstOff. Devuelve los que pudo leer. */
         int leer(short[] dst, int dstOff, int n) throws IOException {
             int hecho = 0;
@@ -675,10 +680,12 @@ final class Audio {
 
     // ---------- Sonido de transición entre imágenes ----------
 
-    static final String[] NOMBRES_TRANSICION = {"Campanita suave", "Clic corto", "Dos tonos"};
+    static final String[] NOMBRES_TRANSICION = {"Campanita suave", "Clic corto", "Dos tonos",
+        "Flash de cámara fotográfica"};
 
     /** Genera con código el sonido de transición: estéreo, a 44100 Hz, sin volumen aplicado. */
     static short[] sonidoTransicion(int tipo) {
+        if (tipo == 3) return Efectos.flash();
         double dur = tipo == 1 ? 0.12 : (tipo == 2 ? 0.40 : 0.60);
         int n = (int) (dur * HZ);
         short[] r = new short[n * 2];
@@ -760,6 +767,277 @@ final class Audio {
             }
         }
         if (prog != null) prog.porcentaje(100);
+    }
+
+    // ---------- Audio nuevo para un video ----------
+
+    /** Ajustes para poner un audio nuevo en un video del teléfono. */
+    static final class AjustesAv {
+        /** Verdadero: se conserva el audio original y se mezcla; falso: se reemplaza. */
+        boolean mezclar = false;
+        int volOrig = 100;
+        int volNuevo = 100;
+        /** Segundo del video en que empieza el audio nuevo. */
+        int inicioSeg = 0;
+        boolean repetir = false;
+        boolean desvanecer = true;
+    }
+
+    private static void ceros(short[] d, int desdeMarco, int hastaMarco) {
+        if (hastaMarco > desdeMarco) Arrays.fill(d, 2 * desdeMarco, 2 * hastaMarco, (short) 0);
+    }
+
+    /** Lee n marcos del audio nuevo que le tocan al momento p del video (con silencio donde no hay). */
+    private static void leerNuevo(Lector l, short[] dst, long p, int n, long inicio, boolean repetir)
+            throws IOException {
+        int hecho = 0;
+        while (hecho < n) {
+            long q = p + hecho - inicio;
+            if (q < 0) {
+                int z = (int) Math.min(n - hecho, -q);
+                ceros(dst, hecho, hecho + z);
+                hecho += z;
+                continue;
+            }
+            if (q >= l.marcos) {
+                if (!repetir || l.marcos == 0) {
+                    ceros(dst, hecho, n);
+                    return;
+                }
+                q %= l.marcos;
+            }
+            int m = (int) Math.min(n - hecho, l.marcos - q);
+            if (l.posicion() != q) l.buscar(q);
+            int k = l.leer(dst, hecho, m);
+            if (k <= 0) {
+                ceros(dst, hecho, n);
+                return;
+            }
+            hecho += k;
+        }
+    }
+
+    /**
+     * Mezcla el tramo [desde, hasta) del audio final de un video, que dura total marcos. El audio
+     * original (orig, puede ser null) solo suena si a.mezclar. Devuelve el pico más alto, antes de la
+     * escala.
+     */
+    static int mezclarVideo(File orig, File nuevo, AjustesAv a, long total, long desde, long hasta,
+            double escala, Salida salida, Progreso prog, Cancelado can, int pIni, int pFin)
+            throws Exception {
+        final int bloque = 8192;
+        final boolean conOrig = a.mezclar && orig != null;
+        final double gO = a.volOrig / 100.0;
+        final double gN = a.volNuevo / 100.0;
+        final long inicio = (long) a.inicioSeg * HZ;
+        short[] bo = new short[bloque * 2];
+        short[] bn = new short[bloque * 2];
+        short[] sal = new short[bloque * 2];
+        int pico = 0;
+        int ultimoPct = -1;
+        try (Lector ln = new Lector(nuevo)) {
+            final long finNuevo = a.repetir ? total : Math.min(total, inicio + ln.marcos);
+            final long largo = Math.max(1, finNuevo - inicio);
+            final long fIn = Math.max(1, Math.min(2L * HZ, largo / 4));
+            final long fOut = Math.max(1, Math.min(3L * HZ, largo / 4));
+            Lector lo = conOrig ? new Lector(orig) : null;
+            try {
+                if (lo != null) lo.buscar(desde);
+                for (long p = desde; p < hasta; p += bloque) {
+                    if (can != null && can.si()) throw new Cancelacion();
+                    int n = (int) Math.min(bloque, hasta - p);
+                    if (lo != null) {
+                        int k = lo.leer(bo, 0, n);
+                        ceros(bo, k, n);
+                    }
+                    leerNuevo(ln, bn, p, n, inicio, a.repetir);
+                    for (int i = 0; i < n; i++) {
+                        long q = p + i;
+                        double g = gN;
+                        if (a.desvanecer) {
+                            long r = q - inicio;
+                            if (r < fIn) g *= Math.max(0.0, (double) r / fIn);
+                            long resta = finNuevo - q;
+                            if (resta < fOut) g *= Math.max(0.0, (double) resta / fOut);
+                        }
+                        for (int ch = 0; ch < 2; ch++) {
+                            double v = bn[2 * i + ch] * g;
+                            if (lo != null) v += bo[2 * i + ch] * gO;
+                            int ab = (int) Math.abs(v);
+                            if (ab > pico) pico = ab;
+                            long s = Math.round(v * escala);
+                            if (s > 32767) s = 32767;
+                            if (s < -32768) s = -32768;
+                            sal[2 * i + ch] = (short) s;
+                        }
+                    }
+                    if (salida != null) salida.marcos(sal, n);
+                    if (prog != null) {
+                        int pct = pIni + (int) ((p - desde + n) * (pFin - pIni) / Math.max(1, hasta - desde));
+                        if (pct != ultimoPct) {
+                            ultimoPct = pct;
+                            prog.porcentaje(pct);
+                        }
+                    }
+                }
+            } finally {
+                if (lo != null) lo.close();
+            }
+        }
+        return pico;
+    }
+
+    /** Un fragmento de unos 20 segundos del audio final del video, para escucharlo antes de crearlo. */
+    static short[] vistaPreviaVideo(File orig, File nuevo, AjustesAv a, long total) throws Exception {
+        long inicio = (long) a.inicioSeg * HZ;
+        long desde = Math.max(0, Math.min(inicio - 3L * HZ, total - 20L * HZ));
+        long hasta = Math.min(total, desde + 20L * HZ);
+        if (hasta <= desde) {
+            desde = 0;
+            hasta = Math.min(total, 20L * HZ);
+        }
+        final int n = (int) (hasta - desde);
+        final short[] datos = new short[n * 2];
+        final int[] fila = {0};
+        mezclarVideo(orig, nuevo, a, total, desde, hasta, 1.0, (st, k) -> {
+            System.arraycopy(st, 0, datos, fila[0] * 2, k * 2);
+            fila[0] += k;
+        }, null, null, 0, 0);
+        return datos;
+    }
+
+    /** Crea el audio (M4A) que llevará el video: el audio nuevo, solo o mezclado con el original. */
+    static void exportarAudioVideo(File orig, File nuevo, AjustesAv a, long total, File destino,
+            Progreso prog, Cancelado can) throws Exception {
+        if (total <= 0) throw new Exception("No pude saber cuánto dura el video.");
+        int pico = mezclarVideo(orig, nuevo, a, total, 0, total, 1.0, null, prog, can, 0, 20);
+        double escala = pico > 32000 ? 32000.0 / pico : 1.0;
+        final byte[] bytes = new byte[8192 * 4];
+        CodificadorAac e = new CodificadorAac(destino);
+        try {
+            mezclarVideo(orig, nuevo, a, total, 0, total, escala, (st, n) -> {
+                aBytes(st, n, bytes);
+                e.agregar(bytes, n * 4);
+            }, prog, can, 20, 99);
+            e.terminar();
+        } catch (Exception ex) {
+            e.abortar();
+            throw ex;
+        }
+        if (prog != null) prog.porcentaje(100);
+    }
+
+    // ---------- Efectos de voz ----------
+
+    /**
+     * Aplica un efecto de voz al tramo [desde, hasta) del audio de trabajo y sigue hasta colaMax
+     * marcos más para no cortar el eco o la reverberación. Devuelve el pico más alto, antes de la
+     * escala.
+     */
+    static int aplicarEfecto(File pcm, int efecto, int intensidad, long desde, long hasta,
+            long colaMax, double escala, Salida salida, Progreso prog, Cancelado can, int pIni,
+            int pFin) throws Exception {
+        final int bloque = 8192;
+        Efectos.Procesador pr = new Efectos.Procesador(efecto, intensidad);
+        final long fin = hasta + Math.min(pr.cola(), colaMax);
+        short[] ent = new short[bloque * 2];
+        short[] sal = new short[bloque * 2];
+        float[] fl = new float[bloque * 2];
+        int pico = 0;
+        int ultimoPct = -1;
+        try (Lector l = new Lector(pcm)) {
+            l.buscar(desde);
+            for (long p = desde; p < fin; p += bloque) {
+                if (can != null && can.si()) throw new Cancelacion();
+                int n = (int) Math.min(bloque, fin - p);
+                Arrays.fill(ent, 0, 2 * n, (short) 0);
+                if (p < hasta) l.leer(ent, 0, (int) Math.min(n, hasta - p));
+                pr.procesar(ent, n, fl);
+                for (int i = 0; i < 2 * n; i++) {
+                    double v = fl[i];
+                    int ab = (int) Math.abs(v);
+                    if (ab > pico) pico = ab;
+                    long s = Math.round(v * escala);
+                    if (s > 32767) s = 32767;
+                    if (s < -32768) s = -32768;
+                    sal[i] = (short) s;
+                }
+                if (salida != null) salida.marcos(sal, n);
+                if (prog != null) {
+                    int pct = pIni + (int) ((p - desde + n) * (pFin - pIni) / Math.max(1, fin - desde));
+                    if (pct != ultimoPct) {
+                        ultimoPct = pct;
+                        prog.porcentaje(pct);
+                    }
+                }
+            }
+        }
+        return pico;
+    }
+
+    /** Un fragmento de unos 20 segundos, con el efecto o sin él, para escucharlo antes de guardar. */
+    static short[] vistaPreviaEfecto(File pcm, int efecto, int intensidad, boolean conEfecto)
+            throws Exception {
+        long total = pcm.length() / BYTES_MARCO;
+        long desde = Math.max(0, Math.min(2L * HZ, total - 20L * HZ));
+        long hasta = Math.min(total, desde + 20L * HZ);
+        if (hasta <= desde) {
+            desde = 0;
+            hasta = Math.min(total, 20L * HZ);
+        }
+        if (!conEfecto) {
+            short[] datos = new short[(int) (hasta - desde) * 2];
+            try (Lector l = new Lector(pcm)) {
+                l.buscar(desde);
+                l.leer(datos, 0, (int) (hasta - desde));
+            }
+            return datos;
+        }
+        long cola = Math.min(new Efectos.Procesador(efecto, intensidad).cola(), 3L * HZ);
+        int pico = aplicarEfecto(pcm, efecto, intensidad, desde, hasta, cola, 1.0, null, null, null,
+                0, 0);
+        double escala = pico > 32000 ? 32000.0 / pico : 1.0;
+        final short[] datos = new short[(int) (hasta - desde + cola) * 2];
+        final int[] fila = {0};
+        aplicarEfecto(pcm, efecto, intensidad, desde, hasta, cola, escala, (st, k) -> {
+            System.arraycopy(st, 0, datos, fila[0] * 2, k * 2);
+            fila[0] += k;
+        }, null, null, 0, 0);
+        return datos;
+    }
+
+    /** Aplica el efecto a todo el audio y lo guarda como M4A (AAC) o WAV. */
+    static void exportarEfecto(File pcm, int efecto, int intensidad, boolean wav, File destino,
+            Progreso prog, Cancelado can) throws Exception {
+        long total = pcm.length() / BYTES_MARCO;
+        if (total <= 0) throw new Exception("No hay audio que procesar.");
+        long cola = new Efectos.Procesador(efecto, intensidad).cola();
+        int pico = aplicarEfecto(pcm, efecto, intensidad, 0, total, Long.MAX_VALUE, 1.0, null, prog,
+                can, 0, 20);
+        double escala = pico > 32000 ? 32000.0 / pico : 1.0;
+        final byte[] bytes = new byte[8192 * 4];
+        if (wav) {
+            try (OutputStream os = new BufferedOutputStream(new FileOutputStream(destino), 1 << 16)) {
+                os.write(cabeceraWav((total + cola) * BYTES_MARCO));
+                aplicarEfecto(pcm, efecto, intensidad, 0, total, Long.MAX_VALUE, escala, (st, n) -> {
+                    aBytes(st, n, bytes);
+                    os.write(bytes, 0, n * 4);
+                }, prog, can, 20, 100);
+            }
+        } else {
+            CodificadorAac e = new CodificadorAac(destino);
+            try {
+                aplicarEfecto(pcm, efecto, intensidad, 0, total, Long.MAX_VALUE, escala, (st, n) -> {
+                    aBytes(st, n, bytes);
+                    e.agregar(bytes, n * 4);
+                }, prog, can, 20, 99);
+                e.terminar();
+            } catch (Exception ex) {
+                e.abortar();
+                throw ex;
+            }
+            if (prog != null) prog.porcentaje(100);
+        }
     }
 
     // ---------- Guardar en el teléfono ----------

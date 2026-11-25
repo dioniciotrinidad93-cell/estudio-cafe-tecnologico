@@ -14,7 +14,10 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.PowerManager;
 import android.provider.OpenableColumns;
+import android.text.Editable;
+import android.text.InputFilter;
 import android.text.InputType;
+import android.text.TextWatcher;
 import android.speech.tts.TextToSpeech;
 import android.view.View;
 import android.view.ViewGroup;
@@ -48,13 +51,14 @@ import java.util.function.IntSupplier;
 import java.util.function.LongConsumer;
 
 /**
- * Estudio Café Tecnológico, versión 0.3.
+ * Estudio Café Tecnológico, versión 0.4.
  * Interfaz hecha por código, pensada para lectores de pantalla (TalkBack, Jieshuo, Prudence):
  * solo botones y textos claros, sin iconos ni gestos de arrastrar.
  *
  * Funciones: mezclar audio con música de fondo, crear un video con audio e imágenes (con zoom,
- * descripción de las imágenes, sonido de transición y proyectos guardados) y transcribir audios a
- * texto. Cada una puede usarse con el asistente (pasos guiados y voz del teléfono) o en modo manual.
+ * texto sobre las imágenes, descripción de las imágenes, sonido de transición y proyectos
+ * guardados), agregar un audio a un video del teléfono, cambiar la voz de un audio con efectos y
+ * transcribir audios a texto. Cada una puede usarse con el asistente (pasos guiados y voz del teléfono) o en modo manual.
  */
 public class MainActivity extends Activity {
 
@@ -75,6 +79,9 @@ public class MainActivity extends Activity {
     private static final int PEDIDO_AUDIO_VIDEO = 3;
     private static final int PEDIDO_IMAGENES = 4;
     private static final int PEDIDO_TRANSCRIPCION = 5;
+    private static final int PEDIDO_VIDEO = 6;
+    private static final int PEDIDO_AUDIO_NUEVO = 7;
+    private static final int PEDIDO_VOZ_EFECTO = 8;
 
     private ScrollView scroll;
     private LinearLayout contenido;
@@ -145,6 +152,31 @@ public class MainActivity extends Activity {
     private String trFalla;
     private String trTexto;
     private Uri trArchivo;
+
+    // Estado de agregar audio a un video, versión 0.4
+    private Uri avVideoUri;
+    private String avVideoNombre;
+    private Video.Info avInfo;
+    private String avNuevoNombre;
+    private File avNuevoPcm;
+    private long avNuevoMarcos;
+    private File avOrigPcm;
+    private int avModo = 0; // 0 reemplazar el audio del video, 1 mezclarlo con el nuevo
+    private int avVolOrig = 100;
+    private int avVolNuevo = 100;
+    private int avInicio = 0;
+    private boolean avRepetir = false;
+    private boolean avDesvanecer = true;
+    private String avNombreSalida = "Video con audio nuevo";
+
+    // Estado del cambio de voz con efectos, versión 0.4
+    private String vzNombre;
+    private File vzPcm;
+    private long vzMarcos;
+    private int vzEfecto = 0;
+    private int vzIntensidad = 5;
+    private int vzFormato = 0;
+    private String vzNombreSalida = "Audio con efecto de voz";
 
     // ---------- Ciclo de vida ----------
 
@@ -302,6 +334,42 @@ public class MainActivity extends Activity {
         return e;
     }
 
+    /** Un cuadro de texto de varias líneas. Cada cambio se avisa enseguida, sin botón de guardar. */
+    private EditText campoMultilinea(String etiqueta, String valor, int maximo,
+            final Consumer<String> alCambiar) {
+        TextView t = texto(etiqueta);
+        EditText e = new EditText(this);
+        e.setId(View.generateViewId());
+        e.setText(valor == null ? "" : valor);
+        e.setTextSize(18);
+        e.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
+        e.setMinLines(2);
+        e.setMaxLines(6);
+        e.setHint(etiqueta);
+        e.setFilters(new InputFilter[] {new InputFilter.LengthFilter(maximo)});
+        t.setLabelFor(e.getId());
+        e.addTextChangedListener(new TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence s, int a, int b, int c) {
+                // no hace falta
+            }
+
+            @Override
+            public void onTextChanged(CharSequence s, int a, int b, int c) {
+                // no hace falta
+            }
+
+            @Override
+            public void afterTextChanged(Editable s) {
+                alCambiar.accept(s.toString());
+            }
+        });
+        contenido.addView(e, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        return e;
+    }
+
     private void aviso(String s) {
         Toast.makeText(this, s, Toast.LENGTH_LONG).show();
     }
@@ -416,7 +484,14 @@ public class MainActivity extends Activity {
     private void elegirArchivo(int pedido, String tipo, boolean varios, Consumer<List<Uri>> alElegir) {
         Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         i.addCategory(Intent.CATEGORY_OPENABLE);
-        i.setType(tipo);
+        if ("audio/*".equals(tipo)) {
+            // Algunos teléfonos marcan los M4A y otros audios como video: se muestran también, y de
+            // un video se usa solo el sonido.
+            i.setType("*/*");
+            i.putExtra(Intent.EXTRA_MIME_TYPES, new String[] {"audio/*", "video/*", "application/ogg"});
+        } else {
+            i.setType(tipo);
+        }
         i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
         if (varios) i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
         pedidoActual = pedido;
@@ -563,13 +638,31 @@ public class MainActivity extends Activity {
     /** Lee un audio y lo deja listo para trabajar; al terminar avisa con el número de marcos. */
     private void prepararAudio(final Uri u, final String nombre, final File pcm,
             final LongConsumer alListo, final Runnable atras) {
+        // Se lee a un archivo aparte: si falla o se cancela, el audio anterior se conserva.
+        final File nuevo = new File(pcm.getParentFile(), pcm.getName().replace(".pcm", "_n.pcm"));
         trabajar("Preparando el audio",
                 "Estoy leyendo " + nombre + ". Mantén la aplicación abierta hasta que termine.",
                 (p, c) -> {
-                    pcm.delete();
-                    Audio.decodificar(this, u, pcm, p, c);
+                    nuevo.delete();
+                    try {
+                        Audio.decodificar(this, u, nuevo, p, c);
+                    } catch (Audio.Cancelacion e) {
+                        nuevo.delete();
+                        throw e;
+                    } catch (Exception e) {
+                        nuevo.delete();
+                        throw new Exception("No pude leer el archivo " + nombre + ". " + textoError(e));
+                    }
                 },
-                () -> alListo.accept(pcm.length() / Audio.BYTES_MARCO),
+                () -> {
+                    pcm.delete();
+                    if (!nuevo.renameTo(pcm)) {
+                        mostrarError("No pude guardar el audio preparado. Revisa el espacio del "
+                                + "teléfono.", atras);
+                        return;
+                    }
+                    alListo.accept(pcm.length() / Audio.BYTES_MARCO);
+                },
                 atras);
     }
 
@@ -636,6 +729,8 @@ public class MainActivity extends Activity {
         texto("Modo actual: " + (asistente() ? "con asistente" : "manual, sin asistente") + ".");
         boton("Mezclar audio con música de fondo", () -> entrar(this::mzInicio, this::mzManual));
         boton("Crear video con audio e imágenes", () -> entrar(this::vdInicio, this::vdManual));
+        boton("Agregar un audio a un video del teléfono", () -> entrar(this::avInicio, this::avManual));
+        boton("Cambiar la voz de un audio con efectos", () -> entrar(this::vzInicio, this::vzManual));
         boton("Transcribir un audio a texto", () -> entrar(this::trInicio, this::trManual));
         boton("Proyectos de video guardados", this::mostrarProyectos);
         boton("Clave de Gemini", () -> mostrarClave(this::mostrarMenu, this::mostrarMenu));
@@ -902,8 +997,6 @@ public class MainActivity extends Activity {
             final Uri u = uris.get(0);
             final String nombre = nombreDe(u);
             final File pcm = cache(esVoz ? "mezcla_voz.pcm" : "mezcla_musica.pcm");
-            if (esVoz) mzVozPcm = null;
-            else mzMusPcm = null;
             prepararAudio(u, nombre, pcm, marcos -> {
                 if (esVoz) {
                     mzVozNombre = nombre;
@@ -1268,7 +1361,7 @@ public class MainActivity extends Activity {
         int n = vdImagenes.size();
         texto(n == 0 ? "Todavía no elegiste imágenes."
                 : "Tienes " + n + (n == 1 ? " imagen." : " imágenes.")
-                + " Toca una imagen para moverla, quitarla, describirla o cambiar su duración y su zoom.");
+                + " Toca una imagen para moverla, quitarla, describirla, ponerle texto o cambiar su duración y su zoom.");
         boton(n == 0 ? "Elegir imágenes" : "Agregar más imágenes", () ->
                 elegirArchivo(PEDIDO_IMAGENES, "image/*", true, uris -> vdAgregar(uris, refrescar)));
         vdListaImagenes(refrescar);
@@ -1311,6 +1404,7 @@ public class MainActivity extends Activity {
             if (im.zoom == 1) t += " Zoom: acercar.";
             else if (im.zoom == 2) t += " Zoom: alejar.";
             if (im.descripcion != null && !im.descripcion.isEmpty()) t += " Tiene descripción.";
+            if (im.rotulo != null && !im.rotulo.trim().isEmpty()) t += " Tiene texto.";
             String av = im.aviso();
             if (!av.isEmpty()) t += " Aviso: " + av;
             boton(t, () -> vdOpcionesImagen(idx, refrescar));
@@ -1431,6 +1525,18 @@ public class MainActivity extends Activity {
         } else {
             boton("Describir esta imagen con Gemini", () -> vdDescribir(esta, aqui, aqui));
         }
+        encabezado("Texto sobre la imagen");
+        texto("Escribe un título, una dedicatoria o cualquier texto corto. Se muestra sobre esta imagen "
+                + "mientras dura. Si es largo, el tamaño se reduce solo para que quepa. En videos "
+                + "verticales se separa de los bordes para que las plataformas no lo tapen. Déjalo "
+                + "vacío si no quieres texto.");
+        campoMultilinea("Texto de esta imagen", im.rotulo, 300, s -> im.rotulo = s);
+        ciclo("Posición del texto", Video.NOMBRES_ROTULO_POS, () -> im.rotuloPos,
+                v -> im.rotuloPos = v);
+        ciclo("Tamaño del texto", Video.NOMBRES_ROTULO_TAM, () -> im.rotuloTam,
+                v -> im.rotuloTam = v);
+        casilla("Franja oscura detrás del texto, para que se lea mejor", im.rotuloFondo,
+                m -> im.rotuloFondo = m);
         encabezado("Zoom");
         ciclo("Zoom de esta imagen", Video.NOMBRES_ZOOM, () -> im.zoom, v -> im.zoom = v);
         if (vdPersonal) {
@@ -1745,6 +1851,635 @@ public class MainActivity extends Activity {
         vdBloqueEfectos(this::vdManual);
         encabezado("Crear el video");
         vdBloqueExportar(this::vdManual);
+        boton("Volver al menú", this::mostrarMenu);
+    }
+
+    // =====================================================================
+    // AGREGAR UN AUDIO A UN VIDEO DEL TELÉFONO
+    // =====================================================================
+
+    private boolean avMezcla() {
+        return avModo == 1 && avInfo != null && avInfo.audio;
+    }
+
+    private boolean avListo() {
+        return avInfo != null && avNuevoPcm != null;
+    }
+
+    private long avTotalMarcos() {
+        return Math.max(1, Math.round(avInfo.seg * Audio.HZ));
+    }
+
+    private Audio.AjustesAv ajustesAv() {
+        Audio.AjustesAv a = new Audio.AjustesAv();
+        a.mezclar = avMezcla();
+        a.volOrig = avVolOrig;
+        a.volNuevo = avVolNuevo;
+        a.inicioSeg = avInicio;
+        a.repetir = avRepetir;
+        a.desvanecer = avDesvanecer;
+        return a;
+    }
+
+    private String avEstadoVolumenes() {
+        String s = "Audio nuevo al " + avVolNuevo + " por ciento.";
+        if (avMezcla()) s = "Audio original del video al " + avVolOrig + " por ciento. " + s;
+        return s;
+    }
+
+    // ----- Bloques -----
+
+    private void avBloqueVideo(final Runnable refrescar) {
+        boolean hay = avInfo != null;
+        if (hay) {
+            texto("Video: " + avVideoNombre + ". Dura " + textoDuracion(Math.round(avInfo.seg))
+                    + ". Tamaño: " + avInfo.ancho + " por " + avInfo.alto + " píxeles. "
+                    + (avInfo.audio ? "Ya tiene audio." : "No tiene audio."));
+        } else {
+            texto("Todavía no elegiste el video.");
+        }
+        boton(hay ? "Cambiar el video" : "Elegir el video", () ->
+                elegirArchivo(PEDIDO_VIDEO, "video/*", false, uris -> {
+                    final Uri u = uris.get(0);
+                    final String nombre = nombreDe(u);
+                    final Video.Info[] info = new Video.Info[1];
+                    trabajar("Revisando el video", "Estoy leyendo los datos de " + nombre + ".",
+                            (p, c) -> info[0] = Video.info(this, u),
+                            () -> {
+                                avVideoUri = u;
+                                avVideoNombre = nombre;
+                                avInfo = info[0];
+                                avOrigPcm = null;
+                                if (!avInfo.audio) avModo = 0;
+                                avInicio = entre(avInicio, 0, Math.max(0, (int) avInfo.seg - 1));
+                                refrescar.run();
+                            }, refrescar);
+                }));
+    }
+
+    private void avBloqueAudio(final Runnable refrescar) {
+        boolean hay = avNuevoPcm != null;
+        if (hay) {
+            texto("Audio nuevo: " + avNuevoNombre + ". Dura " + duracion(avNuevoMarcos) + ".");
+        } else {
+            texto("Todavía no elegiste el audio nuevo.");
+        }
+        boton(hay ? "Cambiar el audio nuevo" : "Elegir el audio nuevo", () ->
+                elegirArchivo(PEDIDO_AUDIO_NUEVO, "audio/*", false, uris -> {
+                    final Uri u = uris.get(0);
+                    final String nombre = nombreDe(u);
+                    final File pcm = cache("av_nuevo.pcm");
+                    prepararAudio(u, nombre, pcm, marcos -> {
+                        avNuevoNombre = nombre;
+                        avNuevoPcm = pcm;
+                        avNuevoMarcos = marcos;
+                        refrescar.run();
+                    }, refrescar);
+                }));
+    }
+
+    private void avBloqueModo(final Runnable refrescar) {
+        if (avInfo == null) return;
+        if (!avInfo.audio) {
+            texto("Este video no tiene audio, así que el audio nuevo se agrega tal cual.");
+            return;
+        }
+        texto("Este video ya tiene su propio audio. Elige qué hacer con él.");
+        ciclo("Qué hacer con el audio del video", new String[] {
+            "Reemplazarlo: solo se oirá el audio nuevo",
+            "Conservarlo y mezclar el audio nuevo con él"}, () -> avModo, v -> {
+                avModo = v;
+                if (v == 1 && avVolNuevo == 100) avVolNuevo = 30;
+                else if (v == 0 && avVolNuevo == 30) avVolNuevo = 100;
+                refrescar.run();
+            });
+    }
+
+    private void avBloqueVolumenes(Runnable alCambiar) {
+        if (avMezcla()) {
+            ajustador("Volumen del audio original del video", () -> avVolOrig, " por ciento",
+                    "Bajar el volumen del audio original", "Subir el volumen del audio original",
+                    () -> avVolOrig = Math.max(0, avVolOrig - 10),
+                    () -> avVolOrig = Math.min(150, avVolOrig + 10), alCambiar);
+        }
+        ajustador("Volumen del audio nuevo", () -> avVolNuevo, " por ciento",
+                "Bajar el volumen del audio nuevo", "Subir el volumen del audio nuevo",
+                () -> avVolNuevo = Math.max(0, avVolNuevo - 5),
+                () -> avVolNuevo = Math.min(150, avVolNuevo + 5), alCambiar);
+    }
+
+    private void avBloqueInicio() {
+        if (!avListo()) return;
+        String d = "El video dura " + textoDuracion(Math.round(avInfo.seg)) + ". El audio nuevo dura "
+                + duracion(avNuevoMarcos) + ".";
+        if (avNuevoMarcos + (long) avInicio * Audio.HZ > avTotalMarcos()) {
+            d += " El audio nuevo se cortará cuando termine el video.";
+        } else if (avRepetir) {
+            d += " Como es más corto, se repetirá hasta el final del video.";
+        } else {
+            d += " Como es más corto, el resto del video quedará sin el audio nuevo"
+                    + (avMezcla() ? ", solo con su audio original." : ", en silencio.");
+        }
+        texto(d);
+        casilla("Repetir el audio nuevo si es más corto que el video", avRepetir, m -> avRepetir = m);
+        casilla("Desvanecer el audio nuevo al empezar y al terminar", avDesvanecer,
+                m -> avDesvanecer = m);
+        final int max = Math.max(0, (int) avInfo.seg - 1);
+        final TextView t = texto("El audio nuevo empieza en el segundo " + avInicio + " del video.");
+        t.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        final int[] pasos = {-10, -1, 1, 10};
+        final String[] nombres = {"Empezar 10 segundos antes", "Empezar 1 segundo antes",
+            "Empezar 1 segundo después", "Empezar 10 segundos después"};
+        for (int k = 0; k < pasos.length; k++) {
+            final int paso = pasos[k];
+            boton(nombres[k], () -> {
+                avInicio = entre(avInicio + paso, 0, max);
+                t.setText("El audio nuevo empieza en el segundo " + avInicio + " del video.");
+            });
+        }
+    }
+
+    /** Si hay que conservar el audio del video y aún no se lee, lo lee y sigue con luego. */
+    private void avAsegurarOriginal(final Runnable luego, final Runnable atras) {
+        if (!avMezcla() || avOrigPcm != null) {
+            luego.run();
+            return;
+        }
+        final File pcm = cache("av_original.pcm");
+        prepararAudio(avVideoUri, avVideoNombre, pcm, marcos -> {
+            avOrigPcm = pcm;
+            luego.run();
+        }, atras);
+    }
+
+    private void avBloqueVista(boolean conPreguntas, final Runnable refrescar) {
+        final TextView estado = texto(avEstadoVolumenes());
+        estado.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        boton("Escuchar la vista previa", () -> avVista(estado, "", refrescar));
+        if (conPreguntas) {
+            encabezado("Según lo que escuchas");
+            boton("El audio nuevo se oye muy fuerte", () -> {
+                avVolNuevo = Math.max(0, avVolNuevo - 5);
+                avVista(estado, "Bajé el audio nuevo.", refrescar);
+            });
+            boton("El audio nuevo casi no se oye", () -> {
+                avVolNuevo = Math.min(150, avVolNuevo + 5);
+                avVista(estado, "Subí el audio nuevo.", refrescar);
+            });
+            if (avMezcla()) {
+                boton("No entiendo bien el audio original", () -> {
+                    avVolNuevo = Math.max(0, avVolNuevo - 10);
+                    avVolOrig = Math.min(150, avVolOrig + 10);
+                    avVista(estado, "Bajé el audio nuevo y subí el original.", refrescar);
+                });
+            }
+        }
+    }
+
+    private void avVista(final TextView estado, final String antes, final Runnable refrescar) {
+        if (avMezcla() && avOrigPcm == null) {
+            avAsegurarOriginal(() -> {
+                refrescar.run();
+                aviso("Listo. Ya puedes escuchar la vista previa.");
+                guia("Listo. Ya puedes escuchar la vista previa.");
+            }, refrescar);
+            return;
+        }
+        detenerVista();
+        if (tts != null) tts.stop();
+        final int id = pantallaId;
+        final Audio.AjustesAv a = ajustesAv();
+        final File orig = avMezcla() ? avOrigPcm : null;
+        final File nuevo = avNuevoPcm;
+        final long total = avTotalMarcos();
+        final String prefijo = antes.isEmpty() ? "" : antes + " ";
+        estado.setText(prefijo + avEstadoVolumenes() + " Preparando la vista previa.");
+        new Thread(() -> {
+            short[] datos = null;
+            String error = null;
+            try {
+                datos = Audio.vistaPreviaVideo(orig, nuevo, a, total);
+            } catch (Throwable e) {
+                error = textoError(e);
+            }
+            final short[] d = datos;
+            final String falla = error;
+            runOnUiThread(() -> {
+                if (id != pantallaId) return;
+                if (falla != null) {
+                    estado.setText(falla);
+                    return;
+                }
+                estado.setText(prefijo + avEstadoVolumenes() + " Escuchando la vista previa.");
+                reproducir(d, () -> {
+                    if (id != pantallaId) return;
+                    estado.setText(avEstadoVolumenes() + " Terminó la vista previa.");
+                    guia("Terminó la vista previa. Dime cómo se oyó.");
+                });
+            });
+        }).start();
+    }
+
+    private void avBloqueExportar(final Runnable volverAqui) {
+        texto("El video final durará lo mismo que el original: "
+                + textoDuracion(Math.round(avInfo.seg)) + ". El video no se vuelve a codificar, así "
+                + "que no pierde calidad y el proceso es rápido.");
+        final EditText nombre = campoNombre("Nombre del archivo", avNombreSalida);
+        boton("Crear el video con el audio nuevo", () -> {
+            avNombreSalida = nombre.getText().toString();
+            avExportar(volverAqui);
+        });
+    }
+
+    private void avExportar(final Runnable volverAqui) {
+        avAsegurarOriginal(() -> avExportarYa(volverAqui), volverAqui);
+    }
+
+    private void avExportarYa(final Runnable volverAqui) {
+        final Audio.AjustesAv a = ajustesAv();
+        final long total = avTotalMarcos();
+        final File orig = avMezcla() ? avOrigPcm : null;
+        final File nuevo = avNuevoPcm;
+        final Uri video = avVideoUri;
+        final int giro = avInfo.giro;
+        final double seg = avInfo.seg;
+        final String nombre = nombreArchivo(avNombreSalida, "Video con audio nuevo") + ".mp4";
+        final File m4a = cache("av_salida.m4a");
+        final File fin = cache("av_final.mp4");
+        final Uri[] resultado = new Uri[1];
+        trabajar("Creando el video",
+                "Estoy poniendo el audio nuevo en tu video. Mantén la aplicación abierta.",
+                (p, c) -> {
+                    try {
+                        m4a.delete();
+                        fin.delete();
+                        Audio.exportarAudioVideo(orig, nuevo, a, total, m4a, escalar(p, 0, 80), c);
+                        Video.unirConAudio(this, video, m4a, giro, seg, fin, escalar(p, 80, 98), c);
+                        resultado[0] = Audio.guardar(this, fin, nombre, "video/mp4", true);
+                        p.porcentaje(100);
+                    } finally {
+                        m4a.delete();
+                        fin.delete();
+                    }
+                },
+                () -> avResultado(resultado[0], nombre), volverAqui);
+    }
+
+    private void avResultado(final Uri uri, String nombre) {
+        final String guardado = Audio.nombreGuardado(this, uri, nombre);
+        nuevaPantalla("Video guardado", this::mostrarMenu);
+        String t = "Tu video se guardó en la carpeta Películas, dentro de la carpeta " + Audio.CARPETA
+                + ", con el nombre " + guardado + ".";
+        texto(t);
+        guia("Listo. " + t);
+        boton("Reproducir el video", () -> abrirArchivo(uri, "video/mp4"));
+        boton("Compartir el video", () -> compartir(uri, "video/mp4"));
+        boton("Probar otro audio con este mismo video", () -> {
+            avNuevoPcm = null;
+            empezar(this::avPasoAudio, this::avManual);
+        });
+        boton("Volver al menú", this::mostrarMenu);
+    }
+
+    // ----- Pasos guiados -----
+
+    private void avInicio() {
+        nuevaPantalla("Agregar un audio a un video", this::mostrarMenu);
+        String t = "Vamos a ponerle un audio nuevo a un video que ya tienes en el teléfono: una "
+                + "música, una narración o lo que quieras. Puedes reemplazar el audio del video o "
+                + "mezclarlo con el nuevo. Te guiaré paso a paso: el video, el audio nuevo, qué hacer "
+                + "con el audio original y los volúmenes, cuándo empieza, una vista previa y por "
+                + "último crear el video.";
+        texto(t);
+        guia(t);
+        boton("Comenzar", this::avPasoVideo);
+        boton("Volver al menú", this::mostrarMenu);
+    }
+
+    private void avPasoVideo() {
+        nuevaPantalla("Paso 1: el video", this::avInicio);
+        String t = "Elige el video del teléfono al que quieres ponerle el audio nuevo.";
+        texto(t);
+        guia(t);
+        avBloqueVideo(this::avPasoVideo);
+        if (avInfo != null) boton("Siguiente: elegir el audio nuevo", this::avPasoAudio);
+        boton("Atrás", this::avInicio);
+    }
+
+    private void avPasoAudio() {
+        nuevaPantalla("Paso 2: el audio nuevo", this::avPasoVideo);
+        String t = "Elige el audio que quieres poner. Puede ser MP3, M4A, WAV u otros formatos, o un "
+                + "video del que quieras usar solo el sonido.";
+        texto(t);
+        guia(t);
+        avBloqueAudio(this::avPasoAudio);
+        if (avNuevoPcm != null) boton("Siguiente: audio original y volúmenes", this::avPasoModo);
+        boton("Atrás", this::avPasoVideo);
+    }
+
+    private void avPasoModo() {
+        nuevaPantalla("Paso 3: audio original y volúmenes", this::avPasoAudio);
+        String t = "Decide qué pasa con el audio que ya tiene el video y ajusta los volúmenes. Para "
+                + "una música de fondo, el audio nuevo suele ir entre 15 y 30 por ciento. Lo "
+                + "comprobarás en la vista previa.";
+        texto(t);
+        guia(t);
+        avBloqueModo(this::avPasoModo);
+        avBloqueVolumenes(null);
+        boton("Siguiente: cuándo empieza el audio nuevo", this::avPasoInicio);
+        boton("Atrás", this::avPasoAudio);
+    }
+
+    private void avPasoInicio() {
+        nuevaPantalla("Paso 4: cuándo empieza", this::avPasoModo);
+        String t = "Elige en qué segundo del video empieza el audio nuevo y qué pasa si duran distinto.";
+        texto(t);
+        guia(t);
+        avBloqueInicio();
+        boton("Siguiente: escuchar la vista previa", this::avPasoVista);
+        boton("Atrás", this::avPasoModo);
+    }
+
+    private void avPasoVista() {
+        nuevaPantalla("Paso 5: vista previa", this::avPasoInicio);
+        String t = "Escucharás un fragmento de unos 20 segundos del audio final del video. Después dime "
+                + "cómo se oyó y lo ajusto. Puedes repetirlo las veces que quieras.";
+        texto(t);
+        guia(t);
+        avBloqueVista(true, this::avPasoVista);
+        boton("Se oye bien, continuar", this::avPasoExportar);
+        boton("Atrás", this::avPasoInicio);
+    }
+
+    private void avPasoExportar() {
+        nuevaPantalla("Paso 6: crear el video", this::avPasoVista);
+        String t = "Último paso. Elige el nombre del archivo y crea el video.";
+        texto(t);
+        guia(t);
+        avBloqueExportar(this::avPasoExportar);
+        boton("Atrás", this::avPasoVista);
+    }
+
+    // ----- Modo manual -----
+
+    private void avManual() {
+        nuevaPantalla("Agregar audio a un video, modo manual", this::mostrarMenu);
+        texto("En modo manual tienes todas las opciones en esta pantalla, sin pasos guiados.");
+        encabezado("Video");
+        avBloqueVideo(this::avManual);
+        encabezado("Audio nuevo");
+        avBloqueAudio(this::avManual);
+        if (!avListo()) {
+            texto("Cuando elijas el video y el audio nuevo, aparecerán los demás ajustes.");
+            boton("Volver al menú", this::mostrarMenu);
+            return;
+        }
+        encabezado("Audio original y volúmenes");
+        avBloqueModo(this::avManual);
+        avBloqueVolumenes(null);
+        encabezado("Cuándo empieza y duración");
+        avBloqueInicio();
+        encabezado("Vista previa");
+        avBloqueVista(false, this::avManual);
+        encabezado("Crear el video");
+        avBloqueExportar(this::avManual);
+        boton("Volver al menú", this::mostrarMenu);
+    }
+
+    // =====================================================================
+    // CAMBIAR LA VOZ DE UN AUDIO CON EFECTOS
+    // =====================================================================
+
+    private String vzEstado() {
+        return Efectos.NOMBRES[vzEfecto] + ". " + Efectos.resumen(vzEfecto, vzIntensidad);
+    }
+
+    private void vzBloqueAudio(final Runnable refrescar) {
+        boolean hay = vzPcm != null;
+        if (hay) {
+            texto("Audio: " + vzNombre + ". Dura " + duracion(vzMarcos) + ".");
+        } else {
+            texto("Todavía no elegiste el audio.");
+        }
+        boton(hay ? "Cambiar el audio" : "Elegir el audio", () ->
+                elegirArchivo(PEDIDO_VOZ_EFECTO, "audio/*", false, uris -> {
+                    final Uri u = uris.get(0);
+                    final String nombre = nombreDe(u);
+                    final File pcm = cache("voz_efecto.pcm");
+                    prepararAudio(u, nombre, pcm, marcos -> {
+                        vzNombre = nombre;
+                        vzPcm = pcm;
+                        vzMarcos = marcos;
+                        refrescar.run();
+                    }, refrescar);
+                }));
+    }
+
+    private void vzBloqueEfecto(final Runnable refrescar) {
+        texto("Efecto elegido: " + Efectos.NOMBRES[vzEfecto] + ". " + Efectos.DESCRIPCIONES[vzEfecto]);
+        for (int i = 0; i < Efectos.NOMBRES.length; i++) {
+            final int idx = i;
+            boton(Efectos.NOMBRES[i] + (i == vzEfecto ? ". Elegido." : ""), () -> {
+                vzEfecto = idx;
+                refrescar.run();
+                guia(Efectos.DESCRIPCIONES[idx]);
+            });
+        }
+    }
+
+    private void vzBloqueIntensidad() {
+        final TextView res = texto(Efectos.resumen(vzEfecto, vzIntensidad));
+        res.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        ajustador("Intensidad del efecto", () -> vzIntensidad, " de 10",
+                "Bajar la intensidad", "Subir la intensidad",
+                () -> vzIntensidad = Math.max(1, vzIntensidad - 1),
+                () -> vzIntensidad = Math.min(10, vzIntensidad + 1),
+                () -> res.setText(Efectos.resumen(vzEfecto, vzIntensidad)));
+    }
+
+    private void vzBloqueVista(boolean conPreguntas) {
+        final TextView estado = texto(vzEstado());
+        estado.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        boton("Escuchar con el efecto", () -> vzReproducir(estado, "", true));
+        boton("Escuchar el original, sin efecto", () -> vzReproducir(estado, "", false));
+        if (conPreguntas) {
+            encabezado("Según lo que escuchas");
+            boton("El efecto es demasiado fuerte", () -> {
+                vzIntensidad = Math.max(1, vzIntensidad - 2);
+                vzReproducir(estado, "Bajé la intensidad.", true);
+            });
+            boton("Casi no se nota el efecto", () -> {
+                vzIntensidad = Math.min(10, vzIntensidad + 2);
+                vzReproducir(estado, "Subí la intensidad.", true);
+            });
+        }
+    }
+
+    private void vzReproducir(final TextView estado, final String antes, final boolean conEfecto) {
+        detenerVista();
+        if (tts != null) tts.stop();
+        final int id = pantallaId;
+        final File pcm = vzPcm;
+        final int efecto = vzEfecto;
+        final int intensidad = vzIntensidad;
+        final String prefijo = antes.isEmpty() ? "" : antes + " ";
+        estado.setText(prefijo + vzEstado() + " Preparando la vista previa.");
+        new Thread(() -> {
+            short[] datos = null;
+            String error = null;
+            try {
+                datos = Audio.vistaPreviaEfecto(pcm, efecto, intensidad, conEfecto);
+            } catch (Throwable e) {
+                error = textoError(e);
+            }
+            final short[] d = datos;
+            final String falla = error;
+            runOnUiThread(() -> {
+                if (id != pantallaId) return;
+                if (falla != null) {
+                    estado.setText(falla);
+                    return;
+                }
+                estado.setText(prefijo + vzEstado()
+                        + (conEfecto ? " Escuchando con el efecto." : " Escuchando el original."));
+                reproducir(d, () -> {
+                    if (id != pantallaId) return;
+                    estado.setText(vzEstado() + " Terminó la vista previa.");
+                    guia("Terminó la vista previa. Dime cómo se oyó.");
+                });
+            });
+        }).start();
+    }
+
+    private void vzBloqueExportar(final Runnable volverAqui) {
+        texto("El audio final durará un poco más que el original si el efecto deja una cola, como el "
+                + "eco o la cueva.");
+        final EditText nombre = campoNombre("Nombre del archivo", vzNombreSalida);
+        ciclo("Formato", new String[] {"M4A, recomendado: pesa poco y suena bien",
+                "WAV, sin compresión: pesa mucho"}, () -> vzFormato, v -> vzFormato = v);
+        boton("Guardar el audio con el efecto", () -> {
+            vzNombreSalida = nombre.getText().toString();
+            vzExportar(volverAqui);
+        });
+    }
+
+    private void vzExportar(final Runnable volverAqui) {
+        final boolean wav = vzFormato == 1;
+        final String nombre = nombreArchivo(vzNombreSalida, "Audio con efecto de voz")
+                + (wav ? ".wav" : ".m4a");
+        final String mime = wav ? "audio/x-wav" : "audio/mp4";
+        final File tmp = cache(wav ? "voz_salida.wav" : "voz_salida.m4a");
+        final File pcm = vzPcm;
+        final int efecto = vzEfecto;
+        final int intensidad = vzIntensidad;
+        final Uri[] resultado = new Uri[1];
+        trabajar("Aplicando el efecto",
+                "Estoy cambiando la voz y guardando tu audio. Puede tardar un poco si es largo. "
+                        + "Mantén la aplicación abierta.",
+                (p, c) -> {
+                    try {
+                        tmp.delete();
+                        Audio.exportarEfecto(pcm, efecto, intensidad, wav, tmp, p, c);
+                        resultado[0] = Audio.guardar(this, tmp, nombre, mime, false);
+                    } finally {
+                        tmp.delete();
+                    }
+                },
+                () -> vzResultado(resultado[0], nombre, mime), volverAqui);
+    }
+
+    private void vzResultado(final Uri uri, String nombre, final String mime) {
+        final String guardado = Audio.nombreGuardado(this, uri, nombre);
+        ultimaMezclaUri = uri;
+        ultimaMezclaNombre = guardado;
+        nuevaPantalla("Audio guardado", this::mostrarMenu);
+        String t = "Tu audio se guardó en la carpeta Música, dentro de la carpeta " + Audio.CARPETA
+                + ", con el nombre " + guardado + ".";
+        texto(t);
+        guia("Listo. " + t);
+        boton("Reproducir el audio", () -> abrirArchivo(uri, mime));
+        boton("Compartir el audio", () -> compartir(uri, mime));
+        boton("Crear un video con este audio", () -> vdUsarAudioExistente(uri, guardado));
+        boton("Probar otro efecto con el mismo audio", () ->
+                empezar(this::vzPasoEfecto, this::vzManual));
+        boton("Volver al menú", this::mostrarMenu);
+    }
+
+    // ----- Pasos guiados -----
+
+    private void vzInicio() {
+        nuevaPantalla("Cambiar la voz con efectos", this::mostrarMenu);
+        String t = "Vamos a cambiar la voz de un audio con un efecto: ardilla, gigante, robot, eco, "
+                + "cueva o teléfono antiguo. Te guiaré paso a paso: el audio, el efecto, la "
+                + "intensidad con una vista previa, y por último guardar.";
+        texto(t);
+        guia(t);
+        boton("Comenzar", this::vzPasoAudio);
+        boton("Volver al menú", this::mostrarMenu);
+    }
+
+    private void vzPasoAudio() {
+        nuevaPantalla("Paso 1: el audio", this::vzInicio);
+        String t = "Elige el audio al que quieres cambiarle la voz. Puede ser MP3, M4A, WAV u otros "
+                + "formatos.";
+        texto(t);
+        guia(t);
+        vzBloqueAudio(this::vzPasoAudio);
+        if (vzPcm != null) boton("Siguiente: elegir el efecto", this::vzPasoEfecto);
+        boton("Atrás", this::vzInicio);
+    }
+
+    private void vzPasoEfecto() {
+        nuevaPantalla("Paso 2: el efecto", this::vzPasoAudio);
+        String t = "Elige un efecto. Después podrás ajustar su intensidad y escucharlo.";
+        texto(t);
+        guia(t);
+        vzBloqueEfecto(this::vzPasoEfecto);
+        boton("Siguiente: intensidad y vista previa", this::vzPasoVista);
+        boton("Atrás", this::vzPasoAudio);
+    }
+
+    private void vzPasoVista() {
+        nuevaPantalla("Paso 3: intensidad y vista previa", this::vzPasoEfecto);
+        String t = "Ajusta la intensidad y escucha un fragmento de unos 20 segundos. Después dime cómo "
+                + "se oyó y lo ajusto. También puedes escuchar el original para comparar.";
+        texto(t);
+        guia(t);
+        vzBloqueIntensidad();
+        vzBloqueVista(true);
+        boton("Se oye bien, continuar", this::vzPasoExportar);
+        boton("Atrás", this::vzPasoEfecto);
+    }
+
+    private void vzPasoExportar() {
+        nuevaPantalla("Paso 4: guardar", this::vzPasoVista);
+        String t = "Último paso. Elige el nombre y el formato, y guarda el audio con el efecto.";
+        texto(t);
+        guia(t);
+        vzBloqueExportar(this::vzPasoExportar);
+        boton("Atrás", this::vzPasoVista);
+    }
+
+    // ----- Modo manual -----
+
+    private void vzManual() {
+        nuevaPantalla("Cambiar la voz, modo manual", this::mostrarMenu);
+        texto("En modo manual tienes todas las opciones en esta pantalla, sin pasos guiados.");
+        encabezado("Audio");
+        vzBloqueAudio(this::vzManual);
+        if (vzPcm == null) {
+            texto("Cuando elijas el audio, aparecerán los demás ajustes.");
+            boton("Volver al menú", this::mostrarMenu);
+            return;
+        }
+        encabezado("Efecto");
+        vzBloqueEfecto(this::vzManual);
+        encabezado("Intensidad");
+        vzBloqueIntensidad();
+        encabezado("Vista previa");
+        vzBloqueVista(false);
+        encabezado("Guardar");
+        vzBloqueExportar(this::vzManual);
         boton("Volver al menú", this::mostrarMenu);
     }
 
@@ -2115,7 +2850,7 @@ public class MainActivity extends Activity {
     private void mostrarProyecto(final String nombre) {
         nuevaPantalla("Proyecto " + nombre, this::mostrarProyectos);
         texto("Abrir el proyecto recupera el audio, las imágenes, el orden, las duraciones, el zoom, "
-                + "el sonido de transición, el formato y las descripciones.");
+                + "el sonido de transición, el texto de cada imagen, el formato y las descripciones.");
         boton("Abrir este proyecto", () -> abrirProyecto(nombre));
         boton("Borrar este proyecto", () -> confirmarBorrarProyecto(nombre));
         boton("Volver a la lista", this::mostrarProyectos);
@@ -2163,6 +2898,10 @@ public class MainActivity extends Activity {
                 o.put("seg", im.seg);
                 o.put("zoom", im.zoom);
                 o.put("descripcion", im.descripcion == null ? "" : im.descripcion);
+                o.put("rotulo", im.rotulo == null ? "" : im.rotulo);
+                o.put("rotuloPos", im.rotuloPos);
+                o.put("rotuloTam", im.rotuloTam);
+                o.put("rotuloFondo", im.rotuloFondo);
                 a.put(o);
             }
             j.put("imagenes", a);
@@ -2209,6 +2948,10 @@ public class MainActivity extends Activity {
                 im.seg = entre(o.optInt("seg", 0), 0, 3600);
                 im.zoom = entre(o.optInt("zoom", 0), 0, 2);
                 im.descripcion = o.optString("descripcion", "");
+                im.rotulo = o.optString("rotulo", "");
+                im.rotuloPos = entre(o.optInt("rotuloPos", 2), 0, 2);
+                im.rotuloTam = entre(o.optInt("rotuloTam", 1), 0, 2);
+                im.rotuloFondo = o.optBoolean("rotuloFondo", true);
                 nuevas.add(im);
             }
             vdImagenes.clear();

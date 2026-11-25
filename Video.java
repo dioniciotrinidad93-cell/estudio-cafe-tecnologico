@@ -15,7 +15,12 @@ import android.media.MediaCodecInfo;
 import android.media.MediaExtractor;
 import android.media.MediaFormat;
 import android.media.MediaMuxer;
+import android.media.MediaMetadataRetriever;
 import android.net.Uri;
+import android.text.Layout;
+import android.text.StaticLayout;
+import android.text.TextPaint;
+import android.graphics.Typeface;
 
 import java.io.File;
 import java.io.InputStream;
@@ -55,6 +60,9 @@ final class Video {
         "Imagen completa con barras negras"
     };
 
+    static final String[] NOMBRES_ROTULO_POS = {"Arriba", "En el centro", "Abajo"};
+    static final String[] NOMBRES_ROTULO_TAM = {"Pequeño", "Mediano", "Grande"};
+
     /** Una imagen elegida por la persona. */
     static final class Imagen {
         Uri uri;
@@ -65,6 +73,10 @@ final class Video {
         int seg; // duración en segundos si se personaliza
         int zoom; // 0 sin zoom, 1 acercar, 2 alejar
         String descripcion = ""; // descripción hecha con Gemini
+        String rotulo = ""; // texto que se dibuja sobre la imagen (título, dedicatoria...)
+        int rotuloPos = 2; // 0 arriba, 1 en el centro, 2 abajo
+        int rotuloTam = 1; // 0 pequeño, 1 mediano, 2 grande
+        boolean rotuloFondo = true; // franja oscura detrás del texto
 
         /** Aviso sobre la calidad de la imagen, o cadena vacía si se ve bien. */
         String aviso() {
@@ -225,7 +237,7 @@ final class Video {
 
     /** Dibuja el cuadro: el fondo y la imagen encima, aumentada z veces desde el centro. */
     private static void dibujarPrimerPlano(Bitmap src, Bitmap fondo, Bitmap dest, int w, int h,
-            int modo, float z) {
+            int modo, float z, Bitmap capa) {
         Canvas cv = new Canvas(dest);
         Paint pt = new Paint(Paint.FILTER_BITMAP_FLAG | Paint.ANTI_ALIAS_FLAG);
         cv.drawBitmap(fondo, 0, 0, null);
@@ -237,6 +249,67 @@ final class Video {
         float dh = sh * s * z;
         cv.drawBitmap(src, null, new RectF((w - dw) / 2, (h - dh) / 2, (w + dw) / 2,
                 (h + dh) / 2), pt);
+        if (capa != null) cv.drawBitmap(capa, 0, 0, null);
+    }
+
+    /**
+     * Dibuja el texto de una imagen en una capa transparente del tamaño del cuadro. Devuelve null si la
+     * imagen no tiene texto. Si el texto es largo, el tamaño se reduce solo hasta que quepa. En videos
+     * verticales el texto se separa más de los bordes de arriba y de abajo, donde las plataformas
+     * ponen sus propios botones y textos.
+     */
+    static Bitmap capaTexto(Imagen im, int w, int h) {
+        String t = im.rotulo == null ? "" : im.rotulo.trim();
+        if (t.isEmpty()) return null;
+        Bitmap capa = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+        Canvas cv = new Canvas(capa);
+        int lado = Math.min(w, h);
+        float[] fracciones = {1f / 22f, 1f / 16f, 1f / 11f};
+        float tam = lado * fracciones[Math.max(0, Math.min(2, im.rotuloTam))];
+        int margenX = Math.round(lado * 0.06f);
+        int margenY = h > w ? Math.round(h * 0.14f) : margenX;
+        int ancho = w - 2 * margenX;
+        TextPaint tp = new TextPaint(Paint.ANTI_ALIAS_FLAG);
+        tp.setColor(Color.WHITE);
+        tp.setTypeface(Typeface.DEFAULT_BOLD);
+        StaticLayout lay;
+        float relleno;
+        while (true) {
+            tp.setTextSize(tam);
+            relleno = im.rotuloFondo ? tam * 0.4f : 0f;
+            lay = StaticLayout.Builder.obtain(t, 0, t.length(), tp, ancho)
+                    .setAlignment(Layout.Alignment.ALIGN_CENTER).setIncludePad(false).build();
+            if (lay.getHeight() + 2 * relleno <= h - 2 * margenY || tam <= 12f) break;
+            tam *= 0.92f;
+        }
+        if (!im.rotuloFondo) {
+            tp.setShadowLayer(Math.max(2f, tam / 10f), 0f, tam / 16f, Color.BLACK);
+        }
+        float y;
+        if (im.rotuloPos == 0) {
+            y = margenY + relleno;
+        } else if (im.rotuloPos == 1) {
+            y = (h - lay.getHeight()) / 2f;
+        } else {
+            y = h - margenY - relleno - lay.getHeight();
+        }
+        if (im.rotuloFondo) {
+            float maxLinea = 0f;
+            for (int i = 0; i < lay.getLineCount(); i++) {
+                maxLinea = Math.max(maxLinea, lay.getLineWidth(i));
+            }
+            float caja = maxLinea + 2 * relleno;
+            float x0 = (w - caja) / 2f;
+            Paint fp = new Paint(Paint.ANTI_ALIAS_FLAG);
+            fp.setColor(Color.argb(160, 0, 0, 0));
+            cv.drawRoundRect(new RectF(x0, y - relleno, x0 + caja, y + lay.getHeight() + relleno),
+                    relleno, relleno, fp);
+        }
+        cv.save();
+        cv.translate(margenX, y);
+        lay.draw(cv);
+        cv.restore();
+        return capa;
     }
 
     static boolean hayZoom(List<Imagen> imagenes) {
@@ -434,10 +507,11 @@ final class Video {
                 // Con zoom se carga la imagen más grande, para que al acercarla no se vea borrosa.
                 Bitmap src = cargar(c, im.uri, zoomea ? Math.max(w, h) * 3 / 2 : Math.max(w, h));
                 dibujarFondo(src, fondo, w, h, encuadre);
+                final Bitmap capa = capaTexto(im, w, h);
                 final long ini = cuadroActual;
                 final long cuantos = fin - ini;
                 if (!zoomea) {
-                    dibujarPrimerPlano(src, fondo, cuadro, w, h, encuadre, 1f);
+                    dibujarPrimerPlano(src, fondo, cuadro, w, h, encuadre, 1f, capa);
                     aYuv(cuadro, w, h, px, yy, uu, vv);
                 }
                 while (cuadroActual < fin) {
@@ -448,7 +522,7 @@ final class Video {
                             double t = cuantos <= 1 ? 0 : (cuadroActual - ini) / (double) (cuantos - 1);
                             double s = t * t * (3 - 2 * t);
                             double z = im.zoom == 1 ? 1 + ZOOM_MAX * s : 1 + ZOOM_MAX * (1 - s);
-                            dibujarPrimerPlano(src, fondo, cuadro, w, h, encuadre, (float) z);
+                            dibujarPrimerPlano(src, fondo, cuadro, w, h, encuadre, (float) z, capa);
                             aYuv(cuadro, w, h, px, yy, uu, vv);
                         }
                         Image im2 = enc.getInputImage(i);
@@ -476,6 +550,7 @@ final class Video {
                     }
                 }
                 src.recycle();
+                if (capa != null) capa.recycle();
             }
             if (cuadroActual < totalMarcos) {
                 throw new Exception("No pude completar el video. Revisa las imágenes elegidas.");
@@ -600,6 +675,199 @@ final class Video {
                 }
             }
         }
+    }
+
+    // ---------- Poner un audio nuevo a un video del teléfono ----------
+
+    /** Lo que se sabe de un video del teléfono. */
+    static final class Info {
+        double seg;
+        boolean audio;
+        int ancho;
+        int alto;
+        int giro;
+        String mime = "";
+    }
+
+    /** Lee la duración, el tamaño, el giro y si el video tiene audio. */
+    static Info info(Context c, Uri u) throws Exception {
+        Info r = new Info();
+        boolean hayVideo = false;
+        long durVideoUs = 0;
+        long durAudioUs = 0;
+        MediaExtractor ex = new MediaExtractor();
+        try {
+            ex.setDataSource(c, u, null);
+            for (int i = 0; i < ex.getTrackCount(); i++) {
+                MediaFormat f = ex.getTrackFormat(i);
+                String m = f.getString(MediaFormat.KEY_MIME);
+                if (m == null) continue;
+                long d = f.containsKey(MediaFormat.KEY_DURATION) ? f.getLong(MediaFormat.KEY_DURATION) : 0;
+                if (m.startsWith("video/") && !hayVideo) {
+                    hayVideo = true;
+                    r.mime = m;
+                    r.ancho = f.containsKey(MediaFormat.KEY_WIDTH) ? f.getInteger(MediaFormat.KEY_WIDTH) : 0;
+                    r.alto = f.containsKey(MediaFormat.KEY_HEIGHT) ? f.getInteger(MediaFormat.KEY_HEIGHT) : 0;
+                    durVideoUs = d;
+                } else if (m.startsWith("audio/")) {
+                    r.audio = true;
+                    durAudioUs = Math.max(durAudioUs, d);
+                }
+            }
+        } catch (Exception e) {
+            throw new Exception("No pude abrir este archivo. Puede que esté dañado o que no sea un "
+                    + "video compatible.");
+        } finally {
+            try {
+                ex.release();
+            } catch (Exception ignorada) {
+                // nada
+            }
+        }
+        if (!hayVideo) throw new Exception("Este archivo no tiene video. Elige un archivo de video.");
+        long durMs = 0;
+        MediaMetadataRetriever mr = new MediaMetadataRetriever();
+        try {
+            mr.setDataSource(c, u);
+            String g = mr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION);
+            r.giro = g == null ? 0 : Integer.parseInt(g.trim());
+            String d = mr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION);
+            durMs = d == null ? 0 : Long.parseLong(d.trim());
+            if (r.ancho <= 0 || r.alto <= 0) {
+                String aw = mr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH);
+                String ah = mr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT);
+                if (aw != null) r.ancho = Integer.parseInt(aw.trim());
+                if (ah != null) r.alto = Integer.parseInt(ah.trim());
+            }
+        } catch (Exception ignorada) {
+            // se usan los datos de las pistas
+        } finally {
+            try {
+                mr.release();
+            } catch (Exception ignorada) {
+                // nada
+            }
+        }
+        long us = durVideoUs > 0 ? durVideoUs : (durMs > 0 ? durMs * 1000 : durAudioUs);
+        r.seg = us / 1000000.0;
+        if (r.seg <= 0) throw new Exception("No pude saber cuánto dura este video.");
+        return r;
+    }
+
+    /**
+     * Pone el audio nuevo (un M4A) en un video del teléfono. El video no se vuelve a codificar: sus
+     * cuadros se copian tal cual, así que no pierde calidad y es rápido. segTotal es lo que dura el
+     * video, y el audio nunca pasa de ahí.
+     */
+    static void unirConAudio(Context c, Uri video, File audio, int giro, double segTotal, File salida,
+            Audio.Progreso prog, Audio.Cancelado can) throws Exception {
+        MediaExtractor ev = new MediaExtractor();
+        MediaExtractor ea = new MediaExtractor();
+        MediaMuxer mx = null;
+        boolean iniciado = false;
+        try {
+            ev.setDataSource(c, video, null);
+            ea.setDataSource(audio.getAbsolutePath());
+            int pv = pistaDe(ev, "video/");
+            int pa = pistaDe(ea, "audio/");
+            if (pv < 0 || pa < 0) throw new Exception("No pude unir el audio nuevo con el video.");
+            ev.selectTrack(pv);
+            ea.selectTrack(pa);
+            MediaFormat fv = ev.getTrackFormat(pv);
+            int cap = 8 << 20;
+            if (fv.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) {
+                cap = Math.min(32 << 20, Math.max(cap, fv.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE)));
+            }
+            final long desfase = Math.max(0, ev.getSampleTime());
+            salida.delete();
+            mx = new MediaMuxer(salida.getAbsolutePath(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+            if (giro != 0) mx.setOrientationHint(giro);
+            int tv;
+            try {
+                tv = mx.addTrack(fv);
+            } catch (IllegalArgumentException | IllegalStateException e) {
+                throw new Exception("El video está en un formato que no se puede guardar como MP4 "
+                        + "sin volver a codificarlo, así que no puedo ponerle el audio nuevo.");
+            }
+            int ta = mx.addTrack(ea.getTrackFormat(pa));
+            mx.start();
+            iniciado = true;
+            ByteBuffer buf = ByteBuffer.allocate(cap);
+            MediaCodec.BufferInfo bi = new MediaCodec.BufferInfo();
+            boolean vFin = false;
+            boolean aFin = false;
+            int ultimoPct = -1;
+            final long limiteUs = Math.round(segTotal * 1000000.0) + desfase;
+            while (!vFin || !aFin) {
+                if (can != null && can.si()) throw new Audio.Cancelacion();
+                long tvv = Long.MAX_VALUE;
+                long taa = Long.MAX_VALUE;
+                if (!vFin) {
+                    tvv = ev.getSampleTime();
+                    if (tvv < 0) {
+                        vFin = true;
+                        tvv = Long.MAX_VALUE;
+                    }
+                }
+                if (!aFin) {
+                    taa = ea.getSampleTime();
+                    if (taa < 0 || taa + desfase > limiteUs) {
+                        aFin = true;
+                        taa = Long.MAX_VALUE;
+                    } else {
+                        taa += desfase;
+                    }
+                }
+                if (vFin && aFin) break;
+                boolean usaV = tvv <= taa;
+                MediaExtractor e = usaV ? ev : ea;
+                buf.clear();
+                int n = e.readSampleData(buf, 0);
+                if (n < 0) {
+                    if (usaV) vFin = true;
+                    else aFin = true;
+                    continue;
+                }
+                bi.offset = 0;
+                bi.size = n;
+                bi.presentationTimeUs = usaV ? tvv : taa;
+                bi.flags = (e.getSampleFlags() & MediaExtractor.SAMPLE_FLAG_SYNC) != 0
+                        ? MediaCodec.BUFFER_FLAG_KEY_FRAME : 0;
+                mx.writeSampleData(usaV ? tv : ta, buf, bi);
+                e.advance();
+                if (prog != null && limiteUs > 0) {
+                    int pct = (int) Math.min(99, bi.presentationTimeUs * 100 / limiteUs);
+                    if (pct != ultimoPct) {
+                        ultimoPct = pct;
+                        prog.porcentaje(pct);
+                    }
+                }
+            }
+        } finally {
+            try {
+                ev.release();
+            } catch (Exception ignorada) {
+                // nada
+            }
+            try {
+                ea.release();
+            } catch (Exception ignorada) {
+                // nada
+            }
+            if (mx != null) {
+                try {
+                    if (iniciado) mx.stop();
+                } catch (Exception ignorada) {
+                    // nada
+                }
+                try {
+                    mx.release();
+                } catch (Exception ignorada) {
+                    // nada
+                }
+            }
+        }
+        if (prog != null) prog.porcentaje(100);
     }
 
     private static int pistaDe(MediaExtractor e, String prefijo) {
