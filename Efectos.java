@@ -22,6 +22,7 @@ final class Efectos {
     static final int ECO = 3;
     static final int CUEVA = 4;
     static final int TELEFONO = 5;
+    static final int DUO = 6;
 
     static final String[] NOMBRES = {
         "Ardilla: voz muy aguda",
@@ -29,7 +30,8 @@ final class Efectos {
         "Robot: voz metálica",
         "Eco: la voz se repite",
         "Cueva: sonido de lugar enorme",
-        "Teléfono o radio antigua"
+        "Teléfono o radio antigua",
+        "Dúo: la voz suena doble"
     };
 
     static final String[] DESCRIPCIONES = {
@@ -41,7 +43,10 @@ final class Efectos {
         "Hace que suene como dentro de una cueva, una iglesia o un salón enorme: la voz se alarga "
                 + "y se apaga poco a poco.",
         "Hace que la voz suene como si saliera de un teléfono antiguo o de una radio de bolsillo: "
-                + "sin graves, sin agudos y un poco áspera."
+                + "sin graves, sin agudos y un poco áspera.",
+        "Duplica la voz con una segunda voz casi igual, apenas retrasada y con un poco de "
+                + "diferencia de tono, como si dos personas dijeran lo mismo a la vez. Da cuerpo "
+                + "a una voz sola."
     };
 
     static int limitar(int intensidad) {
@@ -79,6 +84,9 @@ final class Efectos {
             case CUEVA:
                 return base + (i <= 3 ? "una cueva pequeña." : (i <= 7 ? "una cueva mediana."
                         : "un lugar enorme, con mucha resonancia."));
+            case DUO:
+                return base + "la segunda voz se nota " + grado(i) + " y llega "
+                        + retardoDuoMs(i) + " milésimas de segundo después de la original.";
             default:
                 return base + "voz de teléfono antiguo, " + grado(i) + " marcada.";
         }
@@ -111,6 +119,10 @@ final class Efectos {
         double fb = realimentacionEco(i);
         long veces = (long) Math.ceil(Math.log(0.001) / Math.log(fb));
         return Math.min(8L * HZ, veces * r);
+    }
+
+    private static int retardoDuoMs(int i) {
+        return 18 + 2 * i;
     }
 
     private static double escalaCueva(int i) {
@@ -174,6 +186,11 @@ final class Efectos {
                     c[0] = new Reverberacion(escalaCueva(i), realimentacionCueva(i), i, 0);
                     c[1] = new Reverberacion(escalaCueva(i), realimentacionCueva(i), i, 23);
                     cl = colaCueva(i);
+                    break;
+                case DUO:
+                    c[0] = new Duo(i, 0.0, 0);
+                    c[1] = new Duo(i, Math.PI, 3);
+                    cl = HZ / 8;
                     break;
                 default:
                     c[0] = new Telefono(i);
@@ -342,6 +359,50 @@ final class Efectos {
                 suma = o;
             }
             return seco * x + humedo * suma;
+        }
+    }
+
+    // ---------- Dúo: la voz suena doble ----------
+
+    /**
+     * Suma a la voz una segunda voz casi igual: una copia retrasada unos 20 a 40 milésimas de segundo
+     * cuyo retraso oscila despacio, lo que le da una pequeña diferencia de tono. Cada canal usa una
+     * fase distinta de la oscilación y un retraso un poco distinto, para que la segunda voz se abra
+     * en estéreo.
+     */
+    private static final class Duo implements Canal {
+        private static final int N = 4096;
+        private static final int MASCARA = N - 1;
+        private final float[] buf = new float[N];
+        private int w = 0;
+        private double fase;
+        private final double dFase = 2 * Math.PI * 0.6 / HZ;
+        private final double base;
+        private final double profundidad;
+        private final float seco = 0.8f;
+        private final float humedo;
+
+        Duo(int i, double fase0, int extraMs) {
+            fase = fase0;
+            base = HZ * (retardoDuoMs(i) + extraMs) / 1000.0;
+            profundidad = HZ * (0.5 + 0.35 * i) / 1000.0;
+            humedo = (float) (0.45 + 0.04 * i);
+        }
+
+        @Override
+        public float proc(float x) {
+            buf[w & MASCARA] = x;
+            double retardo = base + profundidad * Math.sin(fase);
+            fase += dFase;
+            if (fase > 2 * Math.PI) fase -= 2 * Math.PI;
+            double pos = w - retardo;
+            int i0 = (int) Math.floor(pos);
+            double fr = pos - i0;
+            float a = buf[i0 & MASCARA];
+            float b = buf[(i0 + 1) & MASCARA];
+            float d = (float) (a + (b - a) * fr);
+            w++;
+            return seco * x + humedo * d;
         }
     }
 

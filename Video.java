@@ -63,6 +63,33 @@ final class Video {
     static final String[] NOMBRES_ROTULO_POS = {"Arriba", "En el centro", "Abajo"};
     static final String[] NOMBRES_ROTULO_TAM = {"Pequeño", "Mediano", "Grande"};
 
+    static final String[] NOMBRES_FUENTE = {
+        "Normal, letra clara y en negrita",
+        "Clásica, con remates, como un libro o un periódico",
+        "Máquina de escribir, todas las letras del mismo ancho",
+        "Estrecha y alta, cabe más texto en cada línea",
+        "Informal, estilo escrito a mano suelto",
+        "Cursiva elegante, para dedicatorias y felicitaciones",
+        "Extra gruesa, para títulos que impacten",
+        "Delgada y ligera, discreta y moderna"
+    };
+
+    static final String[] NOMBRES_COLOR_TEXTO = {"Blanco", "Negro", "Amarillo", "Naranja", "Rojo",
+        "Rosa", "Morado claro", "Azul", "Celeste", "Verde", "Dorado"};
+    static final int[] COLORES_TEXTO = {0xFFFFFFFF, 0xFF000000, 0xFFFFD60A, 0xFFFF9500, 0xFFFF3B30,
+        0xFFFF6FB5, 0xFFB57BFF, 0xFF4DA3FF, 0xFF7FDBFF, 0xFF34C759, 0xFFD4AF37};
+
+    static final String[] NOMBRES_COLOR_FONDO = {"Negro", "Blanco", "Azul oscuro", "Rojo oscuro",
+        "Verde oscuro", "Morado oscuro", "Gris oscuro", "Amarillo"};
+    static final int[] COLORES_FONDO = {0xFF000000, 0xFFFFFFFF, 0xFF0B2A5B, 0xFF7A0C0C, 0xFF0E4D2B,
+        0xFF3B1A6B, 0xFF333333, 0xFFFFD60A};
+
+    /** El destello de luz blanca que ilumina la imagen nueva cada vez que cambia. */
+    static final String[] NOMBRES_FLASH = {"Sin destello", "Destello suave", "Destello normal",
+        "Destello fuerte"};
+    private static final float[] PICO_FLASH = {0f, 0.45f, 0.70f, 0.92f};
+    private static final double DUR_FLASH = 0.30;
+
     /** Una imagen elegida por la persona. */
     static final class Imagen {
         Uri uri;
@@ -76,7 +103,10 @@ final class Video {
         String rotulo = ""; // texto que se dibuja sobre la imagen (título, dedicatoria...)
         int rotuloPos = 2; // 0 arriba, 1 en el centro, 2 abajo
         int rotuloTam = 1; // 0 pequeño, 1 mediano, 2 grande
-        boolean rotuloFondo = true; // franja oscura detrás del texto
+        boolean rotuloFondo = true; // franja detrás del texto
+        int rotuloFuente = 0; // ver NOMBRES_FUENTE
+        int rotuloColor = 0; // color del texto, ver COLORES_TEXTO
+        int rotuloFondoColor = 0; // color de la franja, ver COLORES_FONDO
 
         /** Aviso sobre la calidad de la imagen, o cadena vacía si se ve bien. */
         String aviso() {
@@ -211,6 +241,82 @@ final class Video {
         }
     }
 
+    // ---------- Fuentes y colores del texto ----------
+
+    static Typeface tipografia(int i) {
+        switch (i) {
+            case 1:
+                return Typeface.create(Typeface.SERIF, Typeface.BOLD);
+            case 2:
+                return Typeface.create(Typeface.MONOSPACE, Typeface.BOLD);
+            case 3:
+                return Typeface.create("sans-serif-condensed", Typeface.BOLD);
+            case 4:
+                return Typeface.create("casual", Typeface.NORMAL);
+            case 5:
+                return Typeface.create("cursive", Typeface.BOLD);
+            case 6:
+                return Typeface.create("sans-serif-black", Typeface.NORMAL);
+            case 7:
+                return Typeface.create("sans-serif-light", Typeface.NORMAL);
+            default:
+                return Typeface.DEFAULT_BOLD;
+        }
+    }
+
+    static int colorTexto(Imagen im) {
+        return COLORES_TEXTO[limitar(im.rotuloColor, 0, COLORES_TEXTO.length - 1)];
+    }
+
+    private static int colorBase(Imagen im) {
+        return COLORES_FONDO[limitar(im.rotuloFondoColor, 0, COLORES_FONDO.length - 1)];
+    }
+
+    private static int colorFranja(Imagen im) {
+        int c = colorBase(im);
+        return Color.argb(170, Color.red(c), Color.green(c), Color.blue(c));
+    }
+
+    private static double luminancia(int c) {
+        double[] v = {Color.red(c) / 255.0, Color.green(c) / 255.0, Color.blue(c) / 255.0};
+        for (int i = 0; i < 3; i++) {
+            v[i] = v[i] <= 0.03928 ? v[i] / 12.92 : Math.pow((v[i] + 0.055) / 1.055, 2.4);
+        }
+        return 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
+    }
+
+    /** Razón de contraste entre dos colores, de 1 (iguales) a 21 (blanco y negro). */
+    static double contraste(int a, int b) {
+        double la = luminancia(a);
+        double lb = luminancia(b);
+        return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+    }
+
+    /** Una frase que dice si el texto se leerá bien con los colores elegidos. */
+    static String avisoLegibilidad(Imagen im) {
+        if (!im.rotuloFondo) {
+            return "Sin franja, el texto se apoya solo en una sombra. Se lee mejor con la franja "
+                    + "activada, sobre todo en fotos con muchos detalles.";
+        }
+        if (contraste(colorTexto(im), colorBase(im)) < 4.5) {
+            return "Atención: el color del texto y el de la franja se parecen y el texto será "
+                    + "difícil de leer. Cambia uno de los dos.";
+        }
+        return "Los colores del texto y de la franja contrastan bien: el texto se leerá con claridad.";
+    }
+
+    // ---------- Destello de luz ----------
+
+    private static float alfaFlash(long rel, int n, float pico) {
+        float r = 1f - rel / (float) n;
+        return pico * r * r;
+    }
+
+    private static void aplicarFlash(Bitmap cuadro, float alfa) {
+        if (alfa <= 0.01f) return;
+        new Canvas(cuadro).drawColor(Color.argb(Math.round(255f * Math.min(1f, alfa)), 255, 255, 255));
+    }
+
     // ---------- Composición del cuadro ----------
 
     /** Prepara el fondo del cuadro: negro, o la imagen muy difuminada si el encuadre es el 1. */
@@ -270,8 +376,9 @@ final class Video {
         int margenY = h > w ? Math.round(h * 0.14f) : margenX;
         int ancho = w - 2 * margenX;
         TextPaint tp = new TextPaint(Paint.ANTI_ALIAS_FLAG);
-        tp.setColor(Color.WHITE);
-        tp.setTypeface(Typeface.DEFAULT_BOLD);
+        final int colTexto = colorTexto(im);
+        tp.setColor(colTexto);
+        tp.setTypeface(tipografia(im.rotuloFuente));
         StaticLayout lay;
         float relleno;
         while (true) {
@@ -283,7 +390,8 @@ final class Video {
             tam *= 0.92f;
         }
         if (!im.rotuloFondo) {
-            tp.setShadowLayer(Math.max(2f, tam / 10f), 0f, tam / 16f, Color.BLACK);
+            tp.setShadowLayer(Math.max(2f, tam / 10f), 0f, tam / 16f,
+                    luminancia(colTexto) > 0.4 ? Color.BLACK : Color.WHITE);
         }
         float y;
         if (im.rotuloPos == 0) {
@@ -301,7 +409,7 @@ final class Video {
             float caja = maxLinea + 2 * relleno;
             float x0 = (w - caja) / 2f;
             Paint fp = new Paint(Paint.ANTI_ALIAS_FLAG);
-            fp.setColor(Color.argb(160, 0, 0, 0));
+            fp.setColor(colorFranja(im));
             cv.drawRoundRect(new RectF(x0, y - relleno, x0 + caja, y + lay.getHeight() + relleno),
                     relleno, relleno, fp);
         }
@@ -422,16 +530,21 @@ final class Video {
 
     /**
      * Crea el video. audioM4a es el audio ya codificado; durSeg trae la duración de cada imagen
-     * en segundos; totalSeg es lo que dura el audio (y el video). Si alguna imagen tiene zoom, todo
-     * el video se crea a más cuadros por segundo y con más calidad.
+     * en segundos; totalSeg es lo que dura el audio (y el video). Si alguna imagen tiene zoom, o si
+     * hay destello (flash mayor que 0, de 1 a 3), el video se crea a más cuadros por segundo. Mientras
+     * una imagen está quieta se envían pocos cuadros, para que el video no tarde de más.
      */
     static void crear(Context c, List<Imagen> imagenes, double[] durSeg, File audioM4a,
-            double totalSeg, int formato, int encuadre, File salida, File temporal,
+            double totalSeg, int formato, int encuadre, int flash, File salida, File temporal,
             Audio.Progreso prog, Audio.Cancelado can) throws Exception {
         final int w = TAMANOS[formato][0];
         final int h = TAMANOS[formato][1];
         final boolean conZoom = hayZoom(imagenes);
-        final int fps = conZoom ? FPS_ZOOM : FPS;
+        final boolean conFlash = flash > 0 && imagenes.size() > 1;
+        final boolean conMov = conZoom || conFlash;
+        final int fps = conMov ? FPS_ZOOM : FPS;
+        final int paso = Math.max(1, fps / FPS);
+        final float picoFlash = PICO_FLASH[limitar(flash, 0, PICO_FLASH.length - 1)];
         final long totalMarcos = Math.max(1, Math.round(totalSeg * fps));
         int cuantas = imagenes.size();
 
@@ -448,9 +561,9 @@ final class Video {
         MediaFormat f = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h);
         f.setInteger(MediaFormat.KEY_COLOR_FORMAT,
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible);
-        f.setInteger(MediaFormat.KEY_BIT_RATE, conZoom ? 3000000 : 1000000);
+        f.setInteger(MediaFormat.KEY_BIT_RATE, conZoom ? 3000000 : (conFlash ? 2000000 : 1000000));
         f.setInteger(MediaFormat.KEY_FRAME_RATE, fps);
-        f.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, conZoom ? 2 : 5);
+        f.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, conMov ? 2 : 5);
         f.setInteger(MediaFormat.KEY_BITRATE_MODE,
                 MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR);
         f.setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709);
@@ -510,20 +623,36 @@ final class Video {
                 final Bitmap capa = capaTexto(im, w, h);
                 final long ini = cuadroActual;
                 final long cuantos = fin - ini;
-                if (!zoomea) {
-                    dibujarPrimerPlano(src, fondo, cuadro, w, h, encuadre, 1f, capa);
-                    aYuv(cuadro, w, h, px, yy, uu, vv);
-                }
+                // El destello ilumina la imagen nueva cada vez que cambia (no la primera).
+                final int nFlash = (conFlash && k > 0)
+                        ? Math.max(2, (int) Math.round(DUR_FLASH * fps)) : 0;
+                boolean baseLista = false;
                 while (cuadroActual < fin) {
                     if (can != null && can.si()) throw new Audio.Cancelacion();
                     int i = enc.dequeueInputBuffer(10000);
                     if (i >= 0) {
+                        final long rel = cuadroActual - ini;
+                        long salto = 1;
                         if (zoomea) {
                             double t = cuantos <= 1 ? 0 : (cuadroActual - ini) / (double) (cuantos - 1);
                             double s = t * t * (3 - 2 * t);
                             double z = im.zoom == 1 ? 1 + ZOOM_MAX * s : 1 + ZOOM_MAX * (1 - s);
                             dibujarPrimerPlano(src, fondo, cuadro, w, h, encuadre, (float) z, capa);
+                            if (rel < nFlash) aplicarFlash(cuadro, alfaFlash(rel, nFlash, picoFlash));
                             aYuv(cuadro, w, h, px, yy, uu, vv);
+                        } else if (rel < nFlash) {
+                            dibujarPrimerPlano(src, fondo, cuadro, w, h, encuadre, 1f, capa);
+                            aplicarFlash(cuadro, alfaFlash(rel, nFlash, picoFlash));
+                            aYuv(cuadro, w, h, px, yy, uu, vv);
+                            baseLista = false;
+                        } else {
+                            if (!baseLista) {
+                                dibujarPrimerPlano(src, fondo, cuadro, w, h, encuadre, 1f, capa);
+                                aYuv(cuadro, w, h, px, yy, uu, vv);
+                                baseLista = true;
+                            }
+                            // Imagen quieta: basta con pocos cuadros por segundo.
+                            salto = Math.max(1, Math.min(paso, fin - cuadroActual));
                         }
                         Image im2 = enc.getInputImage(i);
                         if (im2 == null) {
@@ -534,11 +663,11 @@ final class Video {
                         copiarPlano(pl[0], yy, w, h);
                         copiarPlano(pl[1], uu, w / 2, h / 2);
                         copiarPlano(pl[2], vv, w / 2, h / 2);
-                        boolean ultimo = cuadroActual == totalMarcos - 1;
+                        boolean ultimo = cuadroActual + salto >= totalMarcos;
                         enc.queueInputBuffer(i, 0, w * h * 3 / 2,
                                 cuadroActual * 1000000L / fps,
                                 ultimo ? MediaCodec.BUFFER_FLAG_END_OF_STREAM : 0);
-                        cuadroActual++;
+                        cuadroActual += salto;
                     }
                     if (!eos && drenar(enc, mx, est, bi, 0)) eos = true;
                     if (prog != null) {

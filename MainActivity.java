@@ -51,7 +51,7 @@ import java.util.function.IntSupplier;
 import java.util.function.LongConsumer;
 
 /**
- * Estudio Café Tecnológico, versión 0.4.
+ * Estudio Café Tecnológico, versión 0.5.
  * Interfaz hecha por código, pensada para lectores de pantalla (TalkBack, Jieshuo, Prudence):
  * solo botones y textos claros, sin iconos ni gestos de arrastrar.
  *
@@ -178,6 +178,9 @@ public class MainActivity extends Activity {
     private int vzFormato = 0;
     private String vzNombreSalida = "Audio con efecto de voz";
 
+    // Estado de la versión 0.5
+    private int vdFlash = 0; // destello al cambiar de imagen: 0 sin destello, 1 suave, 2 normal, 3 fuerte
+
     // ---------- Ciclo de vida ----------
 
     @Override
@@ -198,6 +201,14 @@ public class MainActivity extends Activity {
         limpiarCache();
         iniciarTts();
         mostrarMenu();
+        if (estado == null) recibirCompartido(getIntent());
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        recibirCompartido(intent);
     }
 
     @Override
@@ -485,10 +496,12 @@ public class MainActivity extends Activity {
         Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         i.addCategory(Intent.CATEGORY_OPENABLE);
         if ("audio/*".equals(tipo)) {
-            // Algunos teléfonos marcan los M4A y otros audios como video: se muestran también, y de
-            // un video se usa solo el sonido.
+            // Algunos teléfonos marcan los M4A y otros audios como video, o sin tipo conocido: se
+            // muestran también, para que ningún archivo aparezca deshabilitado. De un video se usa
+            // solo el sonido, y si un archivo no se puede leer se avisa con un mensaje claro.
             i.setType("*/*");
-            i.putExtra(Intent.EXTRA_MIME_TYPES, new String[] {"audio/*", "video/*", "application/ogg"});
+            i.putExtra(Intent.EXTRA_MIME_TYPES, new String[] {"audio/*", "video/*", "application/ogg",
+                "application/octet-stream"});
         } else {
             i.setType(tipo);
         }
@@ -506,6 +519,11 @@ public class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int pedido, int resultado, Intent datos) {
         super.onActivityResult(pedido, resultado, datos);
+        if (alSeleccionar == null && resultado == RESULT_OK && pedido >= PEDIDO_VOZ
+                && pedido <= PEDIDO_VOZ_EFECTO) {
+            aviso("La aplicación se reinició mientras elegías el archivo. Vuelve a elegirlo, por favor.");
+            return;
+        }
         if (pedido != pedidoActual || alSeleccionar == null) return;
         if (resultado != RESULT_OK || datos == null) return;
         List<Uri> uris = new ArrayList<>();
@@ -803,6 +821,8 @@ public class MainActivity extends Activity {
         texto("Estudio Café Tecnológico, versión " + versionName() + ".");
         texto("Aplicación gratuita y de código abierto, con licencia MIT, creada por "
                 + "Café Tecnológico para que editar audio y video sea accesible con lector de pantalla.");
+        texto("Consejo: en el administrador de archivos de tu teléfono, selecciona un audio o un "
+                + "video, toca Compartir y elige Estudio Café Tecnológico para abrirlo directo aquí.");
         boton("Ver el código en GitHub", () -> abrir(URL_REPO));
         boton("Volver al menú", this::mostrarMenu);
     }
@@ -912,6 +932,135 @@ public class MainActivity extends Activity {
         habla("Así suena la voz elegida.", true);
     }
 
+    // ---------- Recibir archivos con Compartir ----------
+
+    /** Atiende un audio o un video que otra aplicación compartió con Estudio. */
+    private void recibirCompartido(Intent in) {
+        if (in == null) return;
+        String accion = in.getAction();
+        boolean uno = Intent.ACTION_SEND.equals(accion);
+        boolean varios = Intent.ACTION_SEND_MULTIPLE.equals(accion);
+        if (!uno && !varios) return;
+        // Se marca como atendido, para no repetirlo si la pantalla se gira o la aplicación se recrea.
+        setIntent(new Intent(Intent.ACTION_MAIN));
+        if (bloqueo != null) {
+            aviso("Estoy terminando un trabajo. Cuando acabe, vuelve a compartir el archivo.");
+            return;
+        }
+        final List<Uri> uris = new ArrayList<>();
+        try {
+            if (uno) {
+                Uri u = in.getParcelableExtra(Intent.EXTRA_STREAM);
+                if (u != null) uris.add(u);
+            } else {
+                ArrayList<Uri> l = in.getParcelableArrayListExtra(Intent.EXTRA_STREAM);
+                if (l != null) uris.addAll(l);
+            }
+        } catch (Exception ignorada) {
+            // se prueba con los datos del portapapeles del intento
+        }
+        ClipData cd = in.getClipData();
+        if (uris.isEmpty() && cd != null) {
+            for (int i = 0; i < cd.getItemCount(); i++) {
+                Uri u = cd.getItemAt(i).getUri();
+                if (u != null) uris.add(u);
+            }
+        }
+        if (uris.isEmpty()) {
+            aviso("No recibí ningún archivo. Compártelo de nuevo desde el administrador de archivos.");
+            return;
+        }
+        final Uri u = uris.get(0);
+        final boolean muchos = uris.size() > 1;
+        final String nombre = nombreDe(u);
+        try {
+            getContentResolver().takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        } catch (Exception ignorada) {
+            // no todos los proveedores lo permiten; basta con el permiso temporal
+        }
+        String tipo = in.getType();
+        try {
+            String real = getContentResolver().getType(u);
+            if (real != null && !real.isEmpty()) tipo = real;
+        } catch (Exception ignorada) {
+            // se usa el tipo del intento
+        }
+        if (tipo != null && (tipo.startsWith("image/") || tipo.startsWith("text/")
+                || "application/pdf".equals(tipo))) {
+            nuevaPantalla("Archivo no compatible", this::mostrarMenu);
+            String t = "Recibí " + nombre + ", pero no es un audio ni un video. Comparte un archivo "
+                    + "de audio o de video.";
+            texto(t);
+            guia(t);
+            boton("Ir al menú", this::mostrarMenu);
+            return;
+        }
+        // Se comprueba si trae imagen de verdad: algunos teléfonos marcan los audios como video.
+        final Video.Info[] info = new Video.Info[1];
+        trabajar("Revisando el archivo recibido", "Estoy leyendo los datos de " + nombre + ".",
+                (p, c) -> {
+                    try {
+                        info[0] = Video.info(this, u);
+                    } catch (Exception e) {
+                        info[0] = null;
+                    }
+                },
+                () -> menuCompartido(u, nombre, info[0], muchos), this::mostrarMenu);
+    }
+
+    private void menuCompartido(final Uri u, final String nombre, final Video.Info info,
+            boolean muchos) {
+        nuevaPantalla("Archivo recibido", this::mostrarMenu);
+        String t = "Recibí " + (info != null ? "el video " : "el audio ") + nombre + "."
+                + (muchos ? " Compartiste varios archivos; por ahora uso solo el primero." : "")
+                + " ¿Qué quieres hacer con él?";
+        texto(t);
+        guia(t);
+        if (info != null) {
+            encabezado("Con el video");
+            boton("Agregarle un audio a este video", () -> {
+                avUsarVideo(u, nombre, info);
+                aviso("Video elegido: " + nombre);
+                empezar(this::avPasoAudio, this::avManual);
+            });
+            encabezado("Usar solo su sonido");
+        } else {
+            encabezado("Con este audio");
+        }
+        boton("Mezclarlo con música de fondo, como audio principal", () ->
+                mzCargar(true, u, nombre, this::mzDespuesDeVoz, this::mostrarMenu));
+        boton("Usarlo como música de fondo de otro audio", () ->
+                mzCargar(false, u, nombre, this::mzDespuesDeMusica, this::mostrarMenu));
+        boton("Cambiarle la voz con efectos", () ->
+                vzCargar(u, nombre, () -> empezar(this::vzPasoEfecto, this::vzManual),
+                        this::mostrarMenu));
+        boton("Transcribirlo a texto", () ->
+                trCargar(u, nombre, () -> empezar(this::trPasoOpciones, this::trManual),
+                        this::mostrarMenu));
+        boton("Crear un video con este audio y con imágenes", () -> vdUsarAudioExistente(u, nombre));
+        boton("Usarlo como audio nuevo de un video del teléfono", () ->
+                avCargarAudio(u, nombre, this::avDespuesDeAudio, this::mostrarMenu));
+        boton("Volver al menú", this::mostrarMenu);
+    }
+
+    private void mzDespuesDeVoz() {
+        if (!asistente()) mzManual();
+        else if (mzMusPcm == null) mzPasoMusica();
+        else mzPasoVolumenes();
+    }
+
+    private void mzDespuesDeMusica() {
+        if (!asistente()) mzManual();
+        else if (mzVozPcm == null) mzPasoVoz();
+        else mzPasoVolumenes();
+    }
+
+    private void avDespuesDeAudio() {
+        if (!asistente()) avManual();
+        else if (avInfo == null) avPasoVideo();
+        else avPasoModo();
+    }
+
     // ---------- Compartir y abrir lo exportado ----------
 
     private void abrirArchivo(Uri u, String mime) {
@@ -993,23 +1142,26 @@ public class MainActivity extends Activity {
     }
 
     private void mzElegir(final boolean esVoz, final Runnable refrescar) {
-        elegirArchivo(esVoz ? PEDIDO_VOZ : PEDIDO_MUSICA, "audio/*", false, uris -> {
-            final Uri u = uris.get(0);
-            final String nombre = nombreDe(u);
-            final File pcm = cache(esVoz ? "mezcla_voz.pcm" : "mezcla_musica.pcm");
-            prepararAudio(u, nombre, pcm, marcos -> {
-                if (esVoz) {
-                    mzVozNombre = nombre;
-                    mzVozPcm = pcm;
-                    mzVozMarcos = marcos;
-                } else {
-                    mzMusNombre = nombre;
-                    mzMusPcm = pcm;
-                    mzMusMarcos = marcos;
-                }
-                refrescar.run();
-            }, refrescar);
-        });
+        elegirArchivo(esVoz ? PEDIDO_VOZ : PEDIDO_MUSICA, "audio/*", false, uris ->
+                mzCargar(esVoz, uris.get(0), nombreDe(uris.get(0)), refrescar, refrescar));
+    }
+
+    /** Lee un audio y lo deja como audio principal (esVoz) o como música de la mezcla. */
+    private void mzCargar(final boolean esVoz, final Uri u, final String nombre,
+            final Runnable alTerminar, final Runnable atras) {
+        final File pcm = cache(esVoz ? "mezcla_voz.pcm" : "mezcla_musica.pcm");
+        prepararAudio(u, nombre, pcm, marcos -> {
+            if (esVoz) {
+                mzVozNombre = nombre;
+                mzVozPcm = pcm;
+                mzVozMarcos = marcos;
+            } else {
+                mzMusNombre = nombre;
+                mzMusPcm = pcm;
+                mzMusMarcos = marcos;
+            }
+            alTerminar.run();
+        }, atras);
     }
 
     private void mzBloqueVolumenes(Runnable alCambiar) {
@@ -1535,8 +1687,43 @@ public class MainActivity extends Activity {
                 v -> im.rotuloPos = v);
         ciclo("Tamaño del texto", Video.NOMBRES_ROTULO_TAM, () -> im.rotuloTam,
                 v -> im.rotuloTam = v);
-        casilla("Franja oscura detrás del texto, para que se lea mejor", im.rotuloFondo,
-                m -> im.rotuloFondo = m);
+        texto("Elige la fuente y los colores del texto. Te aviso si el texto y la franja se parecen "
+                + "demasiado y costaría leerlo. El aspecto exacto de las fuentes puede variar un poco "
+                + "según tu teléfono.");
+        final TextView[] legible = new TextView[1];
+        final Runnable revisar = () -> {
+            if (legible[0] == null) return;
+            String a = Video.avisoLegibilidad(im);
+            if (!legible[0].getText().toString().equals(a)) legible[0].setText(a);
+        };
+        ciclo("Fuente del texto", Video.NOMBRES_FUENTE, () -> im.rotuloFuente,
+                v -> im.rotuloFuente = v);
+        ciclo("Color del texto", Video.NOMBRES_COLOR_TEXTO, () -> im.rotuloColor, v -> {
+            im.rotuloColor = v;
+            revisar.run();
+        });
+        casilla("Franja de color detrás del texto, para que se lea mejor", im.rotuloFondo, mk -> {
+            im.rotuloFondo = mk;
+            revisar.run();
+        });
+        ciclo("Color de la franja", Video.NOMBRES_COLOR_FONDO, () -> im.rotuloFondoColor, v -> {
+            im.rotuloFondoColor = v;
+            revisar.run();
+        });
+        legible[0] = texto(Video.avisoLegibilidad(im));
+        legible[0].setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        boton("Aplicar este estilo de texto a todas las imágenes", () -> {
+            for (Video.Imagen otra : vdImagenes) {
+                otra.rotuloPos = im.rotuloPos;
+                otra.rotuloTam = im.rotuloTam;
+                otra.rotuloFondo = im.rotuloFondo;
+                otra.rotuloFuente = im.rotuloFuente;
+                otra.rotuloColor = im.rotuloColor;
+                otra.rotuloFondoColor = im.rotuloFondoColor;
+            }
+            aviso("Listo. Todas las imágenes tienen el mismo estilo de texto. Cada una conserva su "
+                    + "propio texto.");
+        });
         encabezado("Zoom");
         ciclo("Zoom de esta imagen", Video.NOMBRES_ZOOM, () -> im.zoom, v -> im.zoom = v);
         if (vdPersonal) {
@@ -1636,6 +1823,16 @@ public class MainActivity extends Activity {
                 texto("Con una sola imagen no hay cambios, así que el sonido no se oirá.");
             }
         }
+        encabezado("Destello de luz");
+        texto("Un destello blanco muy breve que ilumina la imagen nueva cada vez que cambia, como el "
+                + "flash de una cámara. Combina muy bien con el sonido de flash de cámara. Es opcional. "
+                + "Aviso: los destellos pueden molestar a personas sensibles a la luz; si dudas, usa el "
+                + "suave. El video tarda un poco más en crearse.");
+        ciclo("Destello al cambiar de imagen", Video.NOMBRES_FLASH, () -> vdFlash,
+                v -> vdFlash = v);
+        if (vdImagenes.size() < 2) {
+            texto("Con una sola imagen no hay cambios, así que el destello no se verá.");
+        }
     }
 
     private void vdBloqueExportar(final Runnable volverAqui) {
@@ -1646,6 +1843,8 @@ public class MainActivity extends Activity {
             t += " Como hay zoom, el video se crea cuadro por cuadro con la mejor calidad y tarda "
                     + "mucho más: puede tardar tanto como lo que dura el video, o más, según tu "
                     + "teléfono. Conéctalo a la corriente y no cierres la aplicación.";
+        } else if (vdFlash > 0 && n > 1) {
+            t += " Con el destello, el video se crea con más cuadros y tarda algo más de lo normal.";
         }
         texto(t);
         final EditText nombre = campoNombre("Nombre del archivo", vdNombreSalida);
@@ -1688,6 +1887,7 @@ public class MainActivity extends Activity {
         final double[] dur = vdDuraciones();
         final int formato = vdFormato;
         final int encuadre = vdEncuadre;
+        final int flash = vdFlash;
         final boolean trans = vdTrans && imagenes.size() > 1;
         final int tipo = vdTransTipo;
         final int vol = vdTransVol;
@@ -1714,7 +1914,7 @@ public class MainActivity extends Activity {
                             origen = conSonido;
                         }
                         Audio.pcmAM4a(origen, m4a, escalar(p, trans ? 4 : 0, 8), c);
-                        Video.crear(this, imagenes, dur, m4a, total, formato, encuadre, fin, solo,
+                        Video.crear(this, imagenes, dur, m4a, total, formato, encuadre, flash, fin, solo,
                                 escalar(p, 8, 98), c);
                         resultado[0] = Audio.guardar(this, fin, nombre, "video/mp4", true);
                         p.porcentaje(100);
@@ -1753,7 +1953,8 @@ public class MainActivity extends Activity {
         nuevaPantalla("Crear video con audio e imágenes", this::mostrarMenu);
         String t = "Vamos a crear un video con tu audio y una o varias imágenes. Te guiaré paso a "
                 + "paso: elegir el audio, elegir las imágenes (y describirlas si quieres), el tamaño "
-                + "y el encuadre, cuánto dura cada imagen, el zoom y el sonido de transición, y "
+                + "y el encuadre, cuánto dura cada imagen, el zoom, el sonido de transición y el "
+                + "destello de luz, y "
                 + "exportar el video.";
         texto(t);
         guia(t);
@@ -1804,14 +2005,15 @@ public class MainActivity extends Activity {
         texto(t);
         guia(t);
         vdBloqueDuracion(this::vdPasoDuracion);
-        boton("Siguiente: zoom y sonido de transición", this::vdPasoEfectos);
+        boton("Siguiente: zoom, sonido y destello", this::vdPasoEfectos);
         boton("Atrás", this::vdPasoFormato);
     }
 
     private void vdPasoEfectos() {
-        nuevaPantalla("Paso 5: zoom y sonido de transición", this::vdPasoDuracion);
-        String t = "Dos adornos opcionales. El zoom da movimiento a las imágenes. El sonido de "
-                + "transición marca el momento exacto en que pasa de una imagen a la siguiente.";
+        nuevaPantalla("Paso 5: zoom, sonido y destello", this::vdPasoDuracion);
+        String t = "Tres adornos opcionales. El zoom da movimiento a las imágenes. El sonido de "
+                + "transición marca el momento exacto en que pasa de una imagen a la siguiente. El "
+                + "destello ilumina un instante la imagen nueva.";
         texto(t);
         guia(t);
         vdBloqueEfectos(this::vdPasoEfectos);
@@ -1906,12 +2108,7 @@ public class MainActivity extends Activity {
                     trabajar("Revisando el video", "Estoy leyendo los datos de " + nombre + ".",
                             (p, c) -> info[0] = Video.info(this, u),
                             () -> {
-                                avVideoUri = u;
-                                avVideoNombre = nombre;
-                                avInfo = info[0];
-                                avOrigPcm = null;
-                                if (!avInfo.audio) avModo = 0;
-                                avInicio = entre(avInicio, 0, Math.max(0, (int) avInfo.seg - 1));
+                                avUsarVideo(u, nombre, info[0]);
                                 refrescar.run();
                             }, refrescar);
                 }));
@@ -1925,17 +2122,28 @@ public class MainActivity extends Activity {
             texto("Todavía no elegiste el audio nuevo.");
         }
         boton(hay ? "Cambiar el audio nuevo" : "Elegir el audio nuevo", () ->
-                elegirArchivo(PEDIDO_AUDIO_NUEVO, "audio/*", false, uris -> {
-                    final Uri u = uris.get(0);
-                    final String nombre = nombreDe(u);
-                    final File pcm = cache("av_nuevo.pcm");
-                    prepararAudio(u, nombre, pcm, marcos -> {
-                        avNuevoNombre = nombre;
-                        avNuevoPcm = pcm;
-                        avNuevoMarcos = marcos;
-                        refrescar.run();
-                    }, refrescar);
-                }));
+                elegirArchivo(PEDIDO_AUDIO_NUEVO, "audio/*", false, uris ->
+                        avCargarAudio(uris.get(0), nombreDe(uris.get(0)), refrescar, refrescar)));
+    }
+
+    private void avUsarVideo(Uri u, String nombre, Video.Info info) {
+        avVideoUri = u;
+        avVideoNombre = nombre;
+        avInfo = info;
+        avOrigPcm = null;
+        if (!avInfo.audio) avModo = 0;
+        avInicio = entre(avInicio, 0, Math.max(0, (int) avInfo.seg - 1));
+    }
+
+    private void avCargarAudio(final Uri u, final String nombre, final Runnable alTerminar,
+            final Runnable atras) {
+        final File pcm = cache("av_nuevo.pcm");
+        prepararAudio(u, nombre, pcm, marcos -> {
+            avNuevoNombre = nombre;
+            avNuevoPcm = pcm;
+            avNuevoMarcos = marcos;
+            alTerminar.run();
+        }, atras);
     }
 
     private void avBloqueModo(final Runnable refrescar) {
@@ -2262,17 +2470,19 @@ public class MainActivity extends Activity {
             texto("Todavía no elegiste el audio.");
         }
         boton(hay ? "Cambiar el audio" : "Elegir el audio", () ->
-                elegirArchivo(PEDIDO_VOZ_EFECTO, "audio/*", false, uris -> {
-                    final Uri u = uris.get(0);
-                    final String nombre = nombreDe(u);
-                    final File pcm = cache("voz_efecto.pcm");
-                    prepararAudio(u, nombre, pcm, marcos -> {
-                        vzNombre = nombre;
-                        vzPcm = pcm;
-                        vzMarcos = marcos;
-                        refrescar.run();
-                    }, refrescar);
-                }));
+                elegirArchivo(PEDIDO_VOZ_EFECTO, "audio/*", false, uris ->
+                        vzCargar(uris.get(0), nombreDe(uris.get(0)), refrescar, refrescar)));
+    }
+
+    private void vzCargar(final Uri u, final String nombre, final Runnable alTerminar,
+            final Runnable atras) {
+        final File pcm = cache("voz_efecto.pcm");
+        prepararAudio(u, nombre, pcm, marcos -> {
+            vzNombre = nombre;
+            vzPcm = pcm;
+            vzMarcos = marcos;
+            alTerminar.run();
+        }, atras);
     }
 
     private void vzBloqueEfecto(final Runnable refrescar) {
@@ -2410,7 +2620,7 @@ public class MainActivity extends Activity {
     private void vzInicio() {
         nuevaPantalla("Cambiar la voz con efectos", this::mostrarMenu);
         String t = "Vamos a cambiar la voz de un audio con un efecto: ardilla, gigante, robot, eco, "
-                + "cueva o teléfono antiguo. Te guiaré paso a paso: el audio, el efecto, la "
+                + "cueva, teléfono antiguo o dúo, que hace sonar la voz doble. Te guiaré paso a paso: el audio, el efecto, la "
                 + "intensidad con una vista previa, y por último guardar.";
         texto(t);
         guia(t);
@@ -2595,21 +2805,23 @@ public class MainActivity extends Activity {
             texto("Todavía no elegiste el audio.");
         }
         boton(hay ? "Cambiar el audio" : "Elegir el audio", () ->
-                elegirArchivo(PEDIDO_TRANSCRIPCION, "audio/*", false, uris -> {
-                    final Uri u = uris.get(0);
-                    final String nombre = nombreDe(u);
-                    final File pcm = cache("trans_audio.pcm");
-                    trPcm = null;
-                    prepararAudio(u, nombre, pcm, marcos -> {
-                        trNombre = nombre;
-                        trPcm = pcm;
-                        trMarcos = marcos;
-                        int punto = nombre.lastIndexOf('.');
-                        String base = punto > 0 ? nombre.substring(0, punto) : nombre;
-                        trNombreSalida = base + " - transcripción";
-                        refrescar.run();
-                    }, refrescar);
-                }));
+                elegirArchivo(PEDIDO_TRANSCRIPCION, "audio/*", false, uris ->
+                        trCargar(uris.get(0), nombreDe(uris.get(0)), refrescar, refrescar)));
+    }
+
+    private void trCargar(final Uri u, final String nombre, final Runnable alTerminar,
+            final Runnable atras) {
+        final File pcm = cache("trans_audio.pcm");
+        trPcm = null;
+        prepararAudio(u, nombre, pcm, marcos -> {
+            trNombre = nombre;
+            trPcm = pcm;
+            trMarcos = marcos;
+            int punto = nombre.lastIndexOf('.');
+            String base = punto > 0 ? nombre.substring(0, punto) : nombre;
+            trNombreSalida = base + " - transcripción";
+            alTerminar.run();
+        }, atras);
     }
 
     private void trBloqueOpciones() {
@@ -2850,7 +3062,8 @@ public class MainActivity extends Activity {
     private void mostrarProyecto(final String nombre) {
         nuevaPantalla("Proyecto " + nombre, this::mostrarProyectos);
         texto("Abrir el proyecto recupera el audio, las imágenes, el orden, las duraciones, el zoom, "
-                + "el sonido de transición, el texto de cada imagen, el formato y las descripciones.");
+                + "el sonido de transición, el destello, el texto de cada imagen con su fuente y sus "
+                + "colores, el formato y las descripciones.");
         boton("Abrir este proyecto", () -> abrirProyecto(nombre));
         boton("Borrar este proyecto", () -> confirmarBorrarProyecto(nombre));
         boton("Volver a la lista", this::mostrarProyectos);
@@ -2886,6 +3099,7 @@ public class MainActivity extends Activity {
             j.put("transTipo", vdTransTipo);
             j.put("transVol", vdTransVol);
             j.put("zoomGlobal", vdZoomGlobal);
+            j.put("flash", vdFlash);
             j.put("nombreSalida", vdNombreSalida);
             JSONArray a = new JSONArray();
             for (Video.Imagen im : vdImagenes) {
@@ -2902,6 +3116,9 @@ public class MainActivity extends Activity {
                 o.put("rotuloPos", im.rotuloPos);
                 o.put("rotuloTam", im.rotuloTam);
                 o.put("rotuloFondo", im.rotuloFondo);
+                o.put("rotuloFuente", im.rotuloFuente);
+                o.put("rotuloColor", im.rotuloColor);
+                o.put("rotuloFondoColor", im.rotuloFondoColor);
                 a.put(o);
             }
             j.put("imagenes", a);
@@ -2952,6 +3169,10 @@ public class MainActivity extends Activity {
                 im.rotuloPos = entre(o.optInt("rotuloPos", 2), 0, 2);
                 im.rotuloTam = entre(o.optInt("rotuloTam", 1), 0, 2);
                 im.rotuloFondo = o.optBoolean("rotuloFondo", true);
+                im.rotuloFuente = entre(o.optInt("rotuloFuente", 0), 0, Video.NOMBRES_FUENTE.length - 1);
+                im.rotuloColor = entre(o.optInt("rotuloColor", 0), 0, Video.COLORES_TEXTO.length - 1);
+                im.rotuloFondoColor = entre(o.optInt("rotuloFondoColor", 0), 0,
+                        Video.COLORES_FONDO.length - 1);
                 nuevas.add(im);
             }
             vdImagenes.clear();
@@ -2963,6 +3184,7 @@ public class MainActivity extends Activity {
             vdTransTipo = entre(j.optInt("transTipo", 0), 0, Audio.NOMBRES_TRANSICION.length - 1);
             vdTransVol = entre(j.optInt("transVol", 40), 10, 100);
             vdZoomGlobal = entre(j.optInt("zoomGlobal", 0), 0, 3);
+            vdFlash = entre(j.optInt("flash", 0), 0, Video.NOMBRES_FLASH.length - 1);
             vdNombreSalida = j.optString("nombreSalida", "Video con audio");
             vdProyecto = nombre;
             vdAudioPcm = null;
