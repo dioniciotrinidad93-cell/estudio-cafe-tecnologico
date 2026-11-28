@@ -1,11 +1,13 @@
 package com.cafetecnologico.estudio;
 
+import android.Manifest;
 import android.app.Activity;
 import android.content.ActivityNotFoundException;
 import android.content.ClipData;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageInfo;
+import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.media.AudioAttributes;
 import android.media.AudioFormat;
@@ -51,14 +53,15 @@ import java.util.function.IntSupplier;
 import java.util.function.LongConsumer;
 
 /**
- * Estudio Café Tecnológico, versión 0.5.
+ * Estudio Café Tecnológico, versión 0.6.
  * Interfaz hecha por código, pensada para lectores de pantalla (TalkBack, Jieshuo, Prudence):
  * solo botones y textos claros, sin iconos ni gestos de arrastrar.
  *
- * Funciones: mezclar audio con música de fondo, crear un video con audio e imágenes (con zoom,
- * texto sobre las imágenes, descripción de las imágenes, sonido de transición y proyectos
- * guardados), agregar un audio a un video del teléfono, cambiar la voz de un audio con efectos y
- * transcribir audios a texto. Cada una puede usarse con el asistente (pasos guiados y voz del teléfono) o en modo manual.
+ * Funciones: mezclar audio con música de fondo (con bajada automática de la música), crear un video
+ * con audio e imágenes (con zoom, texto animado sobre las imágenes, transiciones visuales,
+ * descripción de las imágenes, sonido de transición y proyectos guardados), agregar un audio a un
+ * video del teléfono, cambiar la voz de un audio con efectos y ecualizador, y transcribir audios a
+ * texto. Cada una puede usarse con el asistente (pasos guiados y voz del teléfono) o en modo manual.
  */
 public class MainActivity extends Activity {
 
@@ -181,6 +184,30 @@ public class MainActivity extends Activity {
     // Estado de la versión 0.5
     private int vdFlash = 0; // destello al cambiar de imagen: 0 sin destello, 1 suave, 2 normal, 3 fuerte
 
+    // Estado de la versión 0.6
+    private boolean mzDuck = false; // la música baja sola cuando se oye la voz (Rubicel Ruiz)
+    private int mzDuckNivel = 30; // cuánto suena la música mientras se oye la voz, en por ciento
+    private int mzDuckSens = 3; // sensibilidad a la voz, de 1 a 5
+    private int vdTransVis = 0; // transición visual entre imágenes, ver Video.NOMBRES_TRANSICION_VISUAL
+    private int vdTransVisDur = 1; // 0 rápida, 1 normal, 2 lenta
+
+    // Grabar audio dentro de la app (sugerencia de Mónica, de Colombia)
+    private static final int PEDIDO_MICROFONO = 40;
+    private static final String[] GR_CUENTAS = {"Empezar de inmediato", "Esperar 3 segundos",
+        "Esperar 5 segundos", "Esperar 10 segundos"};
+    private static final int[] GR_CUENTA_SEG = {0, 3, 5, 10};
+    private Runnable alConcederMicrofono;
+    private Grabadora grabadora;
+    private long grMarcos = 0; // lo que dura la grabación ya terminada
+    private int grCuenta = 1;
+    private int grFormato = 0;
+    private String grNombreSalida = "Grabación";
+    private boolean grEmpezando = false; // hay una espera antes de grabar
+    private boolean grPausaAuto = false; // la grabación se pausó porque saliste de la aplicación
+    private boolean grConfirmaDescartar = false;
+    private int grTic = 0;
+    private Runnable grRefrescarUi;
+
     // ---------- Ciclo de vida ----------
 
     @Override
@@ -199,6 +226,7 @@ public class MainActivity extends Activity {
         setContentView(scroll);
 
         limpiarCache();
+        grArchivo().delete();
         iniciarTts();
         mostrarMenu();
         if (estado == null) recibirCompartido(getIntent());
@@ -215,11 +243,36 @@ public class MainActivity extends Activity {
     protected void onPause() {
         detenerVista();
         if (tts != null) tts.stop();
+        // Al salir de la aplicación Android corta el micrófono: se pausa la grabación para no perderla.
+        if (grabadora != null && grabadora.estado() == Grabadora.GRABANDO) {
+            grabadora.pausar();
+            grPausaAuto = true;
+        }
+        if (grEmpezando) {
+            grEmpezando = false;
+            grTic++;
+            grPausaAuto = true;
+        }
         super.onPause();
     }
 
     @Override
+    protected void onResume() {
+        super.onResume();
+        if (grPausaAuto) {
+            grPausaAuto = false;
+            aviso("La grabación se detuvo un momento porque saliste de la aplicación. Toca "
+                    + "Seguir grabando o Empezar a grabar para continuar.");
+            if (grRefrescarUi != null) grRefrescarUi.run();
+        }
+    }
+
+    @Override
     protected void onDestroy() {
+        if (grabadora != null) {
+            grabadora.detener();
+            grabadora = null;
+        }
         detenerVista();
         if (tts != null) {
             tts.stop();
@@ -745,10 +798,12 @@ public class MainActivity extends Activity {
                 + "modo manual. Gratuito y de código abierto. Las funciones con Gemini usan tu propia "
                 + "clave gratuita de Google.");
         texto("Modo actual: " + (asistente() ? "con asistente" : "manual, sin asistente") + ".");
+        boton("Grabar un audio con el micrófono", () -> entrar(this::grInicio, this::grManual));
         boton("Mezclar audio con música de fondo", () -> entrar(this::mzInicio, this::mzManual));
         boton("Crear video con audio e imágenes", () -> entrar(this::vdInicio, this::vdManual));
         boton("Agregar un audio a un video del teléfono", () -> entrar(this::avInicio, this::avManual));
-        boton("Cambiar la voz de un audio con efectos", () -> entrar(this::vzInicio, this::vzManual));
+        boton("Cambiar la voz de un audio con efectos y ecualizador", () ->
+                entrar(this::vzInicio, this::vzManual));
         boton("Transcribir un audio a texto", () -> entrar(this::trInicio, this::trManual));
         boton("Proyectos de video guardados", this::mostrarProyectos);
         boton("Clave de Gemini", () -> mostrarClave(this::mostrarMenu, this::mostrarMenu));
@@ -1099,6 +1154,9 @@ public class MainActivity extends Activity {
         a.desvanecer = mzDesvanecer;
         a.introSeg = mzIntro;
         a.outroSeg = mzOutro;
+        a.duck = mzDuck;
+        a.duckNivel = mzDuckNivel;
+        a.duckSens = mzDuckSens;
         return a;
     }
 
@@ -1117,11 +1175,19 @@ public class MainActivity extends Activity {
         mzOutro = 0;
         mzRepetir = true;
         mzDesvanecer = true;
+        mzDuck = false;
+        mzDuckNivel = 30;
+        mzDuckSens = 3;
         limpiarCache();
     }
 
     private String estadoVolumenes() {
-        return "Voz al " + mzVolVoz + " por ciento. Música al " + mzVolMus + " por ciento.";
+        String t = "Voz al " + mzVolVoz + " por ciento. Música al " + mzVolMus + " por ciento.";
+        if (mzDuck) {
+            t += " La música baja sola al " + mzDuckNivel + " por ciento de su volumen cuando se oye "
+                    + "la voz.";
+        }
+        return t;
     }
 
     // ----- Bloques que usan los pasos guiados y el modo manual -----
@@ -1175,6 +1241,35 @@ public class MainActivity extends Activity {
                 () -> mzVolMus = Math.min(100, mzVolMus + 5), alCambiar);
     }
 
+
+    /**
+     * La música baja sola cuando se oye la voz y sube cuando la voz hace una pausa, como el Auto
+     * Duck de Audacity. Sugerencia de Rubicel Ruiz.
+     */
+    private void mzBloqueDuck(final Runnable refrescar) {
+        texto("Bajada automática de la música: la música baja sola cuando se oye la voz y sube "
+                + "cuando la voz se detiene. Así puedes dejar la música más fuerte en las pausas y "
+                + "tu voz siempre se entiende. Empieza a bajar un instante antes de que entre la "
+                + "voz. Es opcional.");
+        casilla("Bajar la música automáticamente cuando se oye la voz", mzDuck, m -> {
+            mzDuck = m;
+            if (refrescar != null) refrescar.run();
+        });
+        if (mzDuck) {
+            ajustador("Música mientras se oye la voz", () -> mzDuckNivel, " por ciento de su volumen",
+                    "Que la música baje más", "Que la música baje menos",
+                    () -> mzDuckNivel = Math.max(5, mzDuckNivel - 5),
+                    () -> mzDuckNivel = Math.min(80, mzDuckNivel + 5), null);
+            ajustador("Sensibilidad a la voz", () -> mzDuckSens, " de 5",
+                    "Menos sensible: solo reacciona a la voz fuerte",
+                    "Más sensible: reacciona también a la voz muy baja",
+                    () -> mzDuckSens = Math.max(1, mzDuckSens - 1),
+                    () -> mzDuckSens = Math.min(5, mzDuckSens + 1), null);
+            texto("Consejo: con la bajada automática, sube el volumen de la música de arriba, por "
+                    + "ejemplo al 40 por ciento, para que se oiga bien en las pausas de la voz.");
+        }
+    }
+
     private void mzBloqueDuracion() {
         String d = "Tu audio dura " + duracion(mzVozMarcos) + ". La música dura "
                 + duracion(mzMusMarcos) + ".";
@@ -1214,10 +1309,25 @@ public class MainActivity extends Activity {
                 mzReproducir(estado, "Subí la música.");
             });
             boton("No entiendo bien la voz", () -> {
-                mzVolMus = Math.max(0, mzVolMus - 10);
-                mzVolVoz = Math.min(150, mzVolVoz + 10);
-                mzReproducir(estado, "Bajé la música y subí la voz.");
+                if (mzDuck) {
+                    mzDuckNivel = Math.max(5, mzDuckNivel - 10);
+                    mzReproducir(estado, "Hice que la música baje más cuando se oye la voz.");
+                } else {
+                    mzVolMus = Math.max(0, mzVolMus - 10);
+                    mzVolVoz = Math.min(150, mzVolVoz + 10);
+                    mzReproducir(estado, "Bajé la música y subí la voz.");
+                }
             });
+            if (mzDuck) {
+                boton("La música no baja cuando hablo", () -> {
+                    mzDuckSens = Math.min(5, mzDuckSens + 1);
+                    mzReproducir(estado, "Hice más sensible la bajada automática.");
+                });
+                boton("La música baja con ruidos que no son voz", () -> {
+                    mzDuckSens = Math.max(1, mzDuckSens - 1);
+                    mzReproducir(estado, "Hice menos sensible la bajada automática.");
+                });
+            }
         }
     }
 
@@ -1316,8 +1426,8 @@ public class MainActivity extends Activity {
     private void mzInicio() {
         nuevaPantalla("Mezclar audio con música de fondo", this::mostrarMenu);
         String t = "Vamos a mezclar tu audio con una música de fondo. Te guiaré paso a paso: primero "
-                + "tu audio, luego la música, después los volúmenes, una vista previa para que "
-                + "escuches cómo queda, qué hacer si duran distinto, y por último exportar.";
+                + "tu audio, luego la música, después los volúmenes y la bajada automática de la "
+                + "música, una vista previa para que escuches cómo queda, qué hacer si duran distinto, y por último exportar.";
         texto(t);
         guia(t);
         boton("Comenzar", this::mzPasoVoz);
@@ -1349,11 +1459,13 @@ public class MainActivity extends Activity {
     private void mzPasoVolumenes() {
         nuevaPantalla("Paso 3: los volúmenes", this::mzPasoMusica);
         String t = "Ajusta cuánto suena cada audio. Lo normal es la voz al 100 por ciento y la música "
-                + "entre 10 y 25 por ciento, para que no tape tu voz. Lo podrás comprobar en la "
-                + "vista previa.";
+                + "entre 10 y 25 por ciento, para que no tape tu voz. Si quieres, activa la bajada "
+                + "automática: la música baja sola cuando hablas y sube en las pausas. Lo podrás "
+                + "comprobar en la vista previa.";
         texto(t);
         guia(t);
         mzBloqueVolumenes(null);
+        mzBloqueDuck(this::mzPasoVolumenes);
         boton("Siguiente: escuchar la vista previa", this::mzPasoVista);
         boton("Atrás", this::mzPasoMusica);
     }
@@ -1404,6 +1516,8 @@ public class MainActivity extends Activity {
         }
         encabezado("Volúmenes");
         mzBloqueVolumenes(null);
+        encabezado("Bajada automática de la música");
+        mzBloqueDuck(this::mzManual);
         encabezado("Duración");
         mzBloqueDuracion();
         encabezado("Vista previa");
@@ -1698,6 +1812,11 @@ public class MainActivity extends Activity {
         };
         ciclo("Fuente del texto", Video.NOMBRES_FUENTE, () -> im.rotuloFuente,
                 v -> im.rotuloFuente = v);
+        texto("La animación del texto empieza justo cuando empieza esta imagen. Con animación, el "
+                + "video se crea con más cuadros y tarda algo más. Si la imagen dura muy poco, la "
+                + "animación se acorta sola.");
+        ciclo("Animación del texto", Video.NOMBRES_ANIM_TEXTO, () -> im.rotuloAnim,
+                v -> im.rotuloAnim = v);
         ciclo("Color del texto", Video.NOMBRES_COLOR_TEXTO, () -> im.rotuloColor, v -> {
             im.rotuloColor = v;
             revisar.run();
@@ -1720,6 +1839,7 @@ public class MainActivity extends Activity {
                 otra.rotuloFuente = im.rotuloFuente;
                 otra.rotuloColor = im.rotuloColor;
                 otra.rotuloFondoColor = im.rotuloFondoColor;
+                otra.rotuloAnim = im.rotuloAnim;
             }
             aviso("Listo. Todas las imágenes tienen el mismo estilo de texto. Cada una conserva su "
                     + "propio texto.");
@@ -1823,6 +1943,19 @@ public class MainActivity extends Activity {
                 texto("Con una sola imagen no hay cambios, así que el sonido no se oirá.");
             }
         }
+        encabezado("Transición visual");
+        texto("Un efecto que acompaña el cambio de una imagen a otra: fundido, deslizamiento o "
+                + "cortina. Empieza en el momento exacto del cambio, igual que el sonido de "
+                + "transición y el destello, y dura como máximo la mitad de lo que dura la imagen "
+                + "nueva. Se aplica a todos los cambios. Es opcional. El video tarda más en "
+                + "crearse. La duración solo se usa si eliges una transición.");
+        ciclo("Transición visual entre imágenes", Video.NOMBRES_TRANSICION_VISUAL, () -> vdTransVis,
+                v -> vdTransVis = v);
+        ciclo("Duración de la transición", Video.NOMBRES_DURACION_TRANSICION, () -> vdTransVisDur,
+                v -> vdTransVisDur = v);
+        if (vdImagenes.size() < 2) {
+            texto("Con una sola imagen no hay cambios, así que la transición no se verá.");
+        }
         encabezado("Destello de luz");
         texto("Un destello blanco muy breve que ilumina la imagen nueva cada vez que cambia, como el "
                 + "flash de una cámara. Combina muy bien con el sonido de flash de cámara. Es opcional. "
@@ -1843,8 +1976,9 @@ public class MainActivity extends Activity {
             t += " Como hay zoom, el video se crea cuadro por cuadro con la mejor calidad y tarda "
                     + "mucho más: puede tardar tanto como lo que dura el video, o más, según tu "
                     + "teléfono. Conéctalo a la corriente y no cierres la aplicación.";
-        } else if (vdFlash > 0 && n > 1) {
-            t += " Con el destello, el video se crea con más cuadros y tarda algo más de lo normal.";
+        } else if (((vdFlash > 0 || vdTransVis > 0) && n > 1) || Video.hayAnimTexto(vdImagenes)) {
+            t += " Con el destello, las transiciones o el texto animado, el video se crea con más "
+                    + "cuadros y tarda algo más de lo normal.";
         }
         texto(t);
         final EditText nombre = campoNombre("Nombre del archivo", vdNombreSalida);
@@ -1888,6 +2022,8 @@ public class MainActivity extends Activity {
         final int formato = vdFormato;
         final int encuadre = vdEncuadre;
         final int flash = vdFlash;
+        final int transVis = vdTransVis;
+        final int transVisDur = vdTransVisDur;
         final boolean trans = vdTrans && imagenes.size() > 1;
         final int tipo = vdTransTipo;
         final int vol = vdTransVol;
@@ -1914,8 +2050,8 @@ public class MainActivity extends Activity {
                             origen = conSonido;
                         }
                         Audio.pcmAM4a(origen, m4a, escalar(p, trans ? 4 : 0, 8), c);
-                        Video.crear(this, imagenes, dur, m4a, total, formato, encuadre, flash, fin, solo,
-                                escalar(p, 8, 98), c);
+                        Video.crear(this, imagenes, dur, m4a, total, formato, encuadre, flash,
+                                transVis, transVisDur, fin, solo, escalar(p, 8, 98), c);
                         resultado[0] = Audio.guardar(this, fin, nombre, "video/mp4", true);
                         p.porcentaje(100);
                     } finally {
@@ -1953,9 +2089,9 @@ public class MainActivity extends Activity {
         nuevaPantalla("Crear video con audio e imágenes", this::mostrarMenu);
         String t = "Vamos a crear un video con tu audio y una o varias imágenes. Te guiaré paso a "
                 + "paso: elegir el audio, elegir las imágenes (y describirlas si quieres), el tamaño "
-                + "y el encuadre, cuánto dura cada imagen, el zoom, el sonido de transición y el "
-                + "destello de luz, y "
-                + "exportar el video.";
+                + "y el encuadre, cuánto dura cada imagen, el zoom, el sonido y la transición "
+                + "visual entre imágenes, el destello de luz, y exportar el video. El texto sobre "
+                + "las imágenes, con su animación, se pone al tocar cada imagen de la lista.";
         texto(t);
         guia(t);
         boton("Comenzar", this::vdPasoAudio);
@@ -2005,15 +2141,16 @@ public class MainActivity extends Activity {
         texto(t);
         guia(t);
         vdBloqueDuracion(this::vdPasoDuracion);
-        boton("Siguiente: zoom, sonido y destello", this::vdPasoEfectos);
+        boton("Siguiente: zoom, transiciones y destello", this::vdPasoEfectos);
         boton("Atrás", this::vdPasoFormato);
     }
 
     private void vdPasoEfectos() {
-        nuevaPantalla("Paso 5: zoom, sonido y destello", this::vdPasoDuracion);
-        String t = "Tres adornos opcionales. El zoom da movimiento a las imágenes. El sonido de "
-                + "transición marca el momento exacto en que pasa de una imagen a la siguiente. El "
-                + "destello ilumina un instante la imagen nueva.";
+        nuevaPantalla("Paso 5: zoom, transiciones y destello", this::vdPasoDuracion);
+        String t = "Adornos opcionales. El zoom da movimiento a las imágenes. El sonido de "
+                + "transición marca el momento exacto en que pasa de una imagen a la siguiente. La "
+                + "transición visual, como un fundido o un deslizamiento, hace que el cambio se vea "
+                + "suave. El destello ilumina un instante la imagen nueva.";
         texto(t);
         guia(t);
         vdBloqueEfectos(this::vdPasoEfectos);
@@ -2489,6 +2626,8 @@ public class MainActivity extends Activity {
         texto("Efecto elegido: " + Efectos.NOMBRES[vzEfecto] + ". " + Efectos.DESCRIPCIONES[vzEfecto]);
         for (int i = 0; i < Efectos.NOMBRES.length; i++) {
             final int idx = i;
+            if (i == 0) encabezado("Efectos de voz");
+            if (i == Efectos.EQ0) encabezado("Ecualizador con presets");
             boton(Efectos.NOMBRES[i] + (i == vzEfecto ? ". Elegido." : ""), () -> {
                 vzEfecto = idx;
                 refrescar.run();
@@ -2620,8 +2759,10 @@ public class MainActivity extends Activity {
     private void vzInicio() {
         nuevaPantalla("Cambiar la voz con efectos", this::mostrarMenu);
         String t = "Vamos a cambiar la voz de un audio con un efecto: ardilla, gigante, robot, eco, "
-                + "cueva, teléfono antiguo o dúo, que hace sonar la voz doble. Te guiaré paso a paso: el audio, el efecto, la "
-                + "intensidad con una vista previa, y por último guardar.";
+                + "cueva, teléfono antiguo o dúo, que hace sonar la voz doble. También hay un "
+                + "ecualizador con presets para dar más claridad, más graves, más agudos o quitar el "
+                + "retumbo. Te guiaré paso a paso: el audio, el efecto, la intensidad con una vista "
+                + "previa, y por último guardar.";
         texto(t);
         guia(t);
         boton("Comenzar", this::vzPasoAudio);
@@ -2641,7 +2782,8 @@ public class MainActivity extends Activity {
 
     private void vzPasoEfecto() {
         nuevaPantalla("Paso 2: el efecto", this::vzPasoAudio);
-        String t = "Elige un efecto. Después podrás ajustar su intensidad y escucharlo.";
+        String t = "Elige un efecto de voz o un preset del ecualizador. Después podrás ajustar su "
+                + "intensidad y escucharlo.";
         texto(t);
         guia(t);
         vzBloqueEfecto(this::vzPasoEfecto);
@@ -2691,6 +2833,445 @@ public class MainActivity extends Activity {
         encabezado("Guardar");
         vzBloqueExportar(this::vzManual);
         boton("Volver al menú", this::mostrarMenu);
+    }
+
+    // =====================================================================
+    // GRABAR AUDIO (versión 0.6, sugerencia de Mónica, de Colombia)
+    // =====================================================================
+
+    private File grArchivo() {
+        return cache("grabacion.grab");
+    }
+
+    /** Sigue con siguiente si la aplicación ya tiene el permiso del micrófono; si no, lo pide. */
+    private void conMicrofono(Runnable siguiente) {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                == PackageManager.PERMISSION_GRANTED) {
+            siguiente.run();
+            return;
+        }
+        alConcederMicrofono = siguiente;
+        requestPermissions(new String[] {Manifest.permission.RECORD_AUDIO}, PEDIDO_MICROFONO);
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int pedido, String[] permisos, int[] resultados) {
+        super.onRequestPermissionsResult(pedido, permisos, resultados);
+        if (pedido != PEDIDO_MICROFONO) return;
+        Runnable r = alConcederMicrofono;
+        alConcederMicrofono = null;
+        if (resultados.length > 0 && resultados[0] == PackageManager.PERMISSION_GRANTED) {
+            if (r != null) r.run();
+        } else {
+            aviso("Sin el permiso del micrófono no puedo grabar. Puedes dárselo a la aplicación en "
+                    + "los ajustes del teléfono, en Permisos.");
+        }
+    }
+
+    /** Un pitido corto: tipo 2 para avisar que empieza la grabación y tipo 1 para avisar que termina. */
+    private void grPitido(int tipo) {
+        short[] d = Audio.sonidoTransicion(tipo);
+        for (int i = 0; i < d.length; i++) d[i] = (short) (d[i] * 0.6);
+        reproducir(d, () -> {
+            // no hace falta
+        });
+    }
+
+    private boolean grGrabando() {
+        return grabadora != null && grabadora.estado() != Grabadora.DETENIDA;
+    }
+
+    private String grTextoEstado() {
+        if (grEmpezando) return "Preparándome para grabar. Deja el teléfono quieto.";
+        if (grabadora != null && grabadora.estado() == Grabadora.GRABANDO) return "Grabando.";
+        if (grabadora != null && grabadora.estado() == Grabadora.EN_PAUSA) return "Grabación en pausa.";
+        return "Listo para grabar.";
+    }
+
+    private String grTextoTiempo() {
+        long seg = grabadora == null ? 0 : grabadora.segundos();
+        return "Llevas " + textoDuracion(seg) + " grabados. El máximo es de 30 minutos.";
+    }
+
+    private String grEtiquetaPrincipal() {
+        if (grEmpezando) return "Cancelar la espera";
+        if (grabadora != null && grabadora.estado() == Grabadora.GRABANDO) return "Pausar la grabación";
+        if (grabadora != null && grabadora.estado() == Grabadora.EN_PAUSA) return "Seguir grabando";
+        return "Empezar a grabar";
+    }
+
+    /** Detiene la grabación, conserva lo grabado y sigue con alTerminar. */
+    private void grTerminar(final Runnable alTerminar, String motivo) {
+        grEmpezando = false;
+        grTic++;
+        if (grabadora != null) {
+            grMarcos = grabadora.detener();
+            grabadora = null;
+        }
+        if (motivo != null) aviso(motivo);
+        if (grMarcos <= 0) {
+            aviso("No se grabó nada.");
+            if (grRefrescarUi != null) grRefrescarUi.run();
+            return;
+        }
+        grPitido(1);
+        // El pitido termina antes de cambiar de pantalla.
+        contenido.postDelayed(alTerminar, 300);
+    }
+
+    /** Los controles para grabar: estado, tiempo, espera, botón principal, terminar y descartar. */
+    private void grBloqueGrabacion(final Runnable alTerminar, final Runnable alSalir) {
+        final int id = pantallaId;
+        final TextView estado = texto(grTextoEstado());
+        estado.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        final TextView tiempo = texto(grTextoTiempo());
+        ciclo("Espera antes de empezar", GR_CUENTAS, () -> grCuenta, v -> grCuenta = v);
+        final Button[] principal = new Button[1];
+        final Button[] descartar = new Button[1];
+        final Runnable refrescar = () -> {
+            if (id != pantallaId) return;
+            estado.setText(grTextoEstado());
+            tiempo.setText(grTextoTiempo());
+            principal[0].setText(grEtiquetaPrincipal());
+            grConfirmaDescartar = false;
+            descartar[0].setText("Descartar la grabación");
+        };
+        grRefrescarUi = refrescar;
+        principal[0] = boton(grEtiquetaPrincipal(), () -> {
+            if (grEmpezando) {
+                grEmpezando = false;
+                grTic++;
+                refrescar.run();
+            } else if (grabadora != null && grabadora.estado() == Grabadora.GRABANDO) {
+                grabadora.pausar();
+                grPitido(1);
+                refrescar.run();
+            } else if (grabadora != null && grabadora.estado() == Grabadora.EN_PAUSA) {
+                try {
+                    grabadora.reanudar();
+                } catch (Exception e) {
+                    aviso(textoError(e));
+                }
+                refrescar.run();
+            } else {
+                conMicrofono(() -> grEmpezar(id, refrescar, alTerminar));
+            }
+        });
+        boton("Terminar y revisar la grabación", () -> {
+            if (!grGrabando() || grabadora.segundos() < 1) {
+                aviso("Todavía no hay nada grabado.");
+                return;
+            }
+            grTerminar(alTerminar, null);
+        });
+        boton("Cuánto llevo grabado", () -> {
+            tiempo.setText(grTextoTiempo());
+            tiempo.announceForAccessibility(grTextoTiempo());
+        });
+        descartar[0] = boton("Descartar la grabación", () -> {
+            if (!grGrabando() && !grEmpezando && grMarcos <= 0) {
+                aviso("No hay ninguna grabación que descartar.");
+                return;
+            }
+            if (!grConfirmaDescartar) {
+                grConfirmaDescartar = true;
+                descartar[0].setText("Toca otra vez para descartar la grabación");
+                descartar[0].announceForAccessibility("Toca otra vez para descartar la grabación.");
+                return;
+            }
+            grEmpezando = false;
+            grTic++;
+            if (grabadora != null) {
+                grabadora.descartar();
+                grabadora = null;
+            }
+            grArchivo().delete();
+            grMarcos = 0;
+            grConfirmaDescartar = false;
+            aviso("Grabación descartada.");
+            alSalir.run();
+        });
+        // Atrás nunca descarta la grabación en silencio: la pausa y avisa.
+        volver = () -> {
+            if (grabadora != null && grabadora.estado() == Grabadora.GRABANDO) {
+                grabadora.pausar();
+                refrescar.run();
+                aviso("Pausé la grabación. Sigue guardada. Para salir sin guardarla usa "
+                        + "Descartar la grabación.");
+            } else if (grGrabando()) {
+                aviso("Hay una grabación en pausa. Termínala o descártala antes de salir.");
+            } else if (grEmpezando) {
+                grEmpezando = false;
+                grTic++;
+                refrescar.run();
+            } else {
+                alSalir.run();
+            }
+        };
+    }
+
+    /** Espera la cuenta atrás (si hay), suena el pitido y empieza a grabar. */
+    private void grEmpezar(final int id, final Runnable refrescar, final Runnable alTerminar) {
+        if (id != pantallaId || grGrabando() || grEmpezando) return;
+        final int espera = GR_CUENTA_SEG[Math.max(0, Math.min(GR_CUENTA_SEG.length - 1, grCuenta))];
+        grEmpezando = true;
+        final int tic = ++grTic;
+        refrescar.run();
+        contenido.postDelayed(() -> {
+            if (tic != grTic || !grEmpezando || id != pantallaId) return;
+            grPitido(2);
+            contenido.postDelayed(() -> {
+                if (tic != grTic || !grEmpezando || id != pantallaId) return;
+                grEmpezando = false;
+                try {
+                    Grabadora g = new Grabadora(grArchivo());
+                    g.iniciar();
+                    grabadora = g;
+                    grMarcos = 0;
+                    grLatido(id, refrescar, alTerminar);
+                } catch (Exception e) {
+                    grabadora = null;
+                    aviso(textoError(e));
+                }
+                refrescar.run();
+            }, 550);
+        }, espera * 1000L);
+    }
+
+    /** Cada segundo actualiza el tiempo y revisa si la grabación terminó sola o falló. */
+    private void grLatido(final int id, final Runnable refrescar, final Runnable alTerminar) {
+        contenido.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (id != pantallaId || grabadora == null) return;
+                if (grabadora.estado() == Grabadora.DETENIDA) return;
+                if (grabadora.error() != null) {
+                    grTerminar(alTerminar, grabadora.error());
+                    return;
+                }
+                if (grabadora.llegoAlLimite()) {
+                    grTerminar(alTerminar, "Llegaste al máximo de 30 minutos y la grabación se "
+                            + "detuvo sola.");
+                    return;
+                }
+                refrescar.run();
+                contenido.postDelayed(this, 1000);
+            }
+        }, 1000);
+    }
+
+    /** Resumen de la grabación terminada y botones para escuchar tramos. */
+    private void grBloqueRevision() {
+        final int id = pantallaId;
+        final TextView estado = texto("Grabaste " + duracion(grMarcos) + ". Revisando el volumen.");
+        estado.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        final File f = grArchivo();
+        new Thread(() -> {
+            String nivel;
+            try {
+                int pico = Audio.picoPcm(f);
+                if (pico < 2500) {
+                    nivel = "Se grabó muy bajito. Acércate más al micrófono o habla más fuerte y "
+                            + "vuelve a grabar. Si no, súbele el volumen después, en la mezcla.";
+                } else if (pico >= 32000) {
+                    nivel = "El sonido llegó al máximo y puede haberse distorsionado. Aléjate un poco "
+                            + "del micrófono o habla más suave y vuelve a grabar.";
+                } else {
+                    nivel = "El volumen de la grabación es bueno.";
+                }
+            } catch (Throwable e) {
+                nivel = "No pude revisar el volumen.";
+            }
+            final String texto = "Grabaste " + duracion(grMarcos) + ". " + nivel;
+            runOnUiThread(() -> {
+                if (id == pantallaId) estado.setText(texto);
+            });
+        }).start();
+        boton("Escuchar el principio", () -> grEscuchar(estado, 0));
+        if (grMarcos > 40L * Audio.HZ) {
+            boton("Escuchar un tramo del medio", () -> grEscuchar(estado, grMarcos / 2 - 10L * Audio.HZ));
+        }
+        if (grMarcos > 25L * Audio.HZ) {
+            boton("Escuchar el final", () -> grEscuchar(estado, grMarcos - 20L * Audio.HZ));
+        }
+        texto("Cada botón reproduce unos 20 segundos. Para oír la grabación completa, guárdala y "
+                + "reprodúcela desde la pantalla de guardado.");
+    }
+
+    private void grEscuchar(final TextView estado, final long desde) {
+        detenerVista();
+        if (tts != null) tts.stop();
+        final int id = pantallaId;
+        final File f = grArchivo();
+        estado.setText("Preparando el fragmento.");
+        new Thread(() -> {
+            short[] datos = null;
+            String error = null;
+            try {
+                datos = Audio.tramo(f, desde, 20);
+            } catch (Throwable e) {
+                error = textoError(e);
+            }
+            final short[] d = datos;
+            final String falla = error;
+            runOnUiThread(() -> {
+                if (id != pantallaId) return;
+                if (falla != null) {
+                    estado.setText(falla);
+                    return;
+                }
+                estado.setText("Escuchando un fragmento de la grabación.");
+                reproducir(d, () -> {
+                    if (id != pantallaId) return;
+                    estado.setText("Terminó el fragmento. Grabaste " + duracion(grMarcos) + ".");
+                });
+            });
+        }).start();
+    }
+
+    private void grBloqueGuardar(final Runnable volverAqui) {
+        final EditText nombre = campoNombre("Nombre del archivo", grNombreSalida);
+        ciclo("Formato", new String[] {"M4A, recomendado: pesa poco y suena bien",
+                "WAV, sin compresión: pesa mucho"}, () -> grFormato, v -> grFormato = v);
+        boton("Guardar la grabación", () -> {
+            grNombreSalida = nombre.getText().toString();
+            grGuardar(volverAqui);
+        });
+    }
+
+    private void grGuardar(final Runnable volverAqui) {
+        final boolean wav = grFormato == 1;
+        final String nombre = nombreArchivo(grNombreSalida, "Grabación") + (wav ? ".wav" : ".m4a");
+        final String mime = wav ? "audio/x-wav" : "audio/mp4";
+        final File tmp = cache(wav ? "grab_salida.wav" : "grab_salida.m4a");
+        final File pcm = grArchivo();
+        final Uri[] resultado = new Uri[1];
+        trabajar("Guardando la grabación",
+                "Estoy guardando tu grabación. Mantén la aplicación abierta.",
+                (p, c) -> {
+                    try {
+                        tmp.delete();
+                        if (wav) Audio.pcmAWav(pcm, tmp, p, c);
+                        else Audio.pcmAM4a(pcm, tmp, p, c);
+                        resultado[0] = Audio.guardar(this, tmp, nombre, mime, false);
+                    } finally {
+                        tmp.delete();
+                    }
+                },
+                () -> grResultado(resultado[0], nombre, mime), volverAqui);
+    }
+
+    private void grResultado(final Uri uri, String nombre, final String mime) {
+        final String guardado = Audio.nombreGuardado(this, uri, nombre);
+        ultimaMezclaUri = uri;
+        ultimaMezclaNombre = guardado;
+        nuevaPantalla("Grabación guardada", this::mostrarMenu);
+        String t = "Tu grabación se guardó en la carpeta Música, dentro de la carpeta " + Audio.CARPETA
+                + ", con el nombre " + guardado + ". Ya puedes usarla en las demás funciones.";
+        texto(t);
+        guia("Listo. " + t);
+        boton("Reproducir la grabación", () -> abrirArchivo(uri, mime));
+        boton("Compartir la grabación", () -> compartir(uri, mime));
+        boton("Mezclarla con música de fondo", () ->
+                mzCargar(true, uri, guardado,
+                        () -> empezar(this::mzPasoMusica, this::mzManual), this::mostrarMenu));
+        boton("Crear un video con esta grabación", () -> vdUsarAudioExistente(uri, guardado));
+        boton("Cambiarle la voz con efectos", () ->
+                vzCargar(uri, guardado, () -> empezar(this::vzPasoEfecto, this::vzManual),
+                        this::mostrarMenu));
+        boton("Grabar otro audio", () -> {
+            grMarcos = 0;
+            grArchivo().delete();
+            empezar(this::grPasoPreparar, this::grManual);
+        });
+        boton("Volver al menú", this::mostrarMenu);
+    }
+
+    // ----- Pasos guiados -----
+
+    private void grInicio() {
+        nuevaPantalla("Grabar un audio", this::mostrarMenu);
+        String t = "Vamos a grabar un audio con el micrófono del teléfono. Te guiaré paso a paso: "
+                + "preparar la grabación, grabar, revisarla y guardarla. Después podrás mezclarla con "
+                + "música, ponerla en un video o cambiarle la voz.";
+        texto(t);
+        guia(t);
+        boton("Comenzar", this::grPasoPreparar);
+        boton("Volver al menú", this::mostrarMenu);
+    }
+
+    private void grPasoPreparar() {
+        nuevaPantalla("Paso 1: preparar la grabación", this::grInicio);
+        String t = "Busca un lugar silencioso. Sostén el teléfono a unos veinte centímetros de tu "
+                + "boca, sin tapar el micrófono, que suele estar en la parte de abajo. Mientras "
+                + "grabas, el teléfono no debe hablar: si usas un lector de pantalla, usa audífonos "
+                + "o evita tocar la pantalla, porque su voz podría quedar grabada. Al tocar Empezar "
+                + "a grabar hay una espera, que puedes cambiar, y suena un pitido justo cuando "
+                + "empieza la grabación. Puedes grabar hasta 30 minutos. Si sales de la aplicación, "
+                + "la grabación se pausa. La primera vez, Android te pedirá permiso para usar el "
+                + "micrófono.";
+        texto(t);
+        guia(t);
+        boton("Siguiente: grabar", this::grPasoGrabar);
+        boton("Atrás", this::grInicio);
+    }
+
+    private void grPasoGrabar() {
+        nuevaPantalla("Paso 2: grabar", this::grPasoPreparar);
+        String t;
+        if (grMarcos > 0) {
+            t = "Ya tienes una grabación de " + duracion(grMarcos) + ". Si empiezas a grabar de "
+                    + "nuevo, se reemplazará.";
+            texto(t);
+            boton("Seguir con la grabación que ya tengo", this::grPasoRevisar);
+        } else {
+            t = "Toca Empezar a grabar. Cuando termines, toca Terminar y revisar la grabación.";
+            texto(t);
+        }
+        guia(t);
+        grBloqueGrabacion(this::grPasoRevisar, this::grPasoPreparar);
+        boton("Atrás", this::grPasoPreparar);
+    }
+
+    private void grPasoRevisar() {
+        nuevaPantalla("Paso 3: revisar la grabación", this::grPasoGrabar);
+        String t = "Escucha tu grabación y dime si te gusta. Si no, puedes grabarla otra vez.";
+        texto(t);
+        guia(t);
+        grBloqueRevision();
+        boton("Siguiente: guardar", this::grPasoGuardar);
+        boton("Grabar otra vez", this::grPasoGrabar);
+        boton("Atrás", this::grPasoGrabar);
+    }
+
+    private void grPasoGuardar() {
+        nuevaPantalla("Paso 4: guardar", this::grPasoRevisar);
+        String t = "Último paso. Elige el nombre y el formato, y guarda la grabación.";
+        texto(t);
+        guia(t);
+        grBloqueGuardar(this::grPasoGuardar);
+        boton("Atrás", this::grPasoRevisar);
+    }
+
+    // ----- Modo manual -----
+
+    private void grManual() {
+        nuevaPantalla("Grabar audio, modo manual", this::mostrarMenu);
+        texto("En modo manual tienes todo en esta pantalla, sin pasos guiados. Mientras grabas, el "
+                + "teléfono no debe hablar: usa audífonos si tienes lector de pantalla.");
+        encabezado("Grabar");
+        if (grMarcos > 0 && !grGrabando()) {
+            texto("Ya tienes una grabación de " + duracion(grMarcos) + ". Si empiezas a grabar de "
+                    + "nuevo, se reemplazará.");
+        }
+        grBloqueGrabacion(this::grManual, this::mostrarMenu);
+        if (grMarcos > 0 && !grGrabando()) {
+            encabezado("Revisar");
+            grBloqueRevision();
+            encabezado("Guardar");
+            grBloqueGuardar(this::grManual);
+        }
+        boton("Volver al menú", () -> volver.run());
     }
 
     // =====================================================================
@@ -3100,6 +3681,8 @@ public class MainActivity extends Activity {
             j.put("transVol", vdTransVol);
             j.put("zoomGlobal", vdZoomGlobal);
             j.put("flash", vdFlash);
+            j.put("transVis", vdTransVis);
+            j.put("transVisDur", vdTransVisDur);
             j.put("nombreSalida", vdNombreSalida);
             JSONArray a = new JSONArray();
             for (Video.Imagen im : vdImagenes) {
@@ -3119,6 +3702,7 @@ public class MainActivity extends Activity {
                 o.put("rotuloFuente", im.rotuloFuente);
                 o.put("rotuloColor", im.rotuloColor);
                 o.put("rotuloFondoColor", im.rotuloFondoColor);
+                o.put("rotuloAnim", im.rotuloAnim);
                 a.put(o);
             }
             j.put("imagenes", a);
@@ -3173,6 +3757,8 @@ public class MainActivity extends Activity {
                 im.rotuloColor = entre(o.optInt("rotuloColor", 0), 0, Video.COLORES_TEXTO.length - 1);
                 im.rotuloFondoColor = entre(o.optInt("rotuloFondoColor", 0), 0,
                         Video.COLORES_FONDO.length - 1);
+                im.rotuloAnim = entre(o.optInt("rotuloAnim", 0), 0,
+                        Video.NOMBRES_ANIM_TEXTO.length - 1);
                 nuevas.add(im);
             }
             vdImagenes.clear();
@@ -3185,6 +3771,10 @@ public class MainActivity extends Activity {
             vdTransVol = entre(j.optInt("transVol", 40), 10, 100);
             vdZoomGlobal = entre(j.optInt("zoomGlobal", 0), 0, 3);
             vdFlash = entre(j.optInt("flash", 0), 0, Video.NOMBRES_FLASH.length - 1);
+            vdTransVis = entre(j.optInt("transVis", 0), 0,
+                    Video.NOMBRES_TRANSICION_VISUAL.length - 1);
+            vdTransVisDur = entre(j.optInt("transVisDur", 1), 0,
+                    Video.NOMBRES_DURACION_TRANSICION.length - 1);
             vdNombreSalida = j.optString("nombreSalida", "Video con audio");
             vdProyecto = nombre;
             vdAudioPcm = null;

@@ -84,6 +84,32 @@ final class Video {
     static final int[] COLORES_FONDO = {0xFF000000, 0xFFFFFFFF, 0xFF0B2A5B, 0xFF7A0C0C, 0xFF0E4D2B,
         0xFF3B1A6B, 0xFF333333, 0xFFFFD60A};
 
+    /** Animaciones del texto sobre las imágenes (sugerencia de lizpalmy). */
+    static final String[] NOMBRES_ANIM_TEXTO = {
+        "Sin animación, el texto aparece fijo",
+        "Aparecer con fundido",
+        "Aparecer y desaparecer con fundido",
+        "Subir desde abajo",
+        "Entrar deslizándose desde la izquierda",
+        "Escribir letra por letra, como máquina de escribir",
+        "Crecer desde el centro"
+    };
+    static final int ANIM_ESCRIBIR = 5;
+    static final int ANIM_FUNDIDO_SALIDA = 2;
+
+    /** Transiciones visuales entre imágenes (sugerencia de Karime y de la comunidad). */
+    static final String[] NOMBRES_TRANSICION_VISUAL = {
+        "Sin transición, corte directo",
+        "Fundido cruzado: una imagen se disuelve en la otra",
+        "Fundido por negro: la imagen se oscurece y aparece la siguiente",
+        "Deslizar: la imagen nueva empuja a la anterior hacia la izquierda",
+        "Subir: la imagen nueva entra desde abajo",
+        "Cortina: la imagen nueva se descubre de izquierda a derecha"
+    };
+    static final String[] NOMBRES_DURACION_TRANSICION = {
+        "Rápida, medio segundo", "Normal, un segundo", "Lenta, un segundo y medio"};
+    private static final double[] SEG_TRANSICION = {0.5, 1.0, 1.5};
+
     /** El destello de luz blanca que ilumina la imagen nueva cada vez que cambia. */
     static final String[] NOMBRES_FLASH = {"Sin destello", "Destello suave", "Destello normal",
         "Destello fuerte"};
@@ -107,6 +133,7 @@ final class Video {
         int rotuloFuente = 0; // ver NOMBRES_FUENTE
         int rotuloColor = 0; // color del texto, ver COLORES_TEXTO
         int rotuloFondoColor = 0; // color de la franja, ver COLORES_FONDO
+        int rotuloAnim = 0; // animación del texto, ver NOMBRES_ANIM_TEXTO
 
         /** Aviso sobre la calidad de la imagen, o cadena vacía si se ve bien. */
         String aviso() {
@@ -341,9 +368,205 @@ final class Video {
         cv.drawColor(Color.argb(110, 0, 0, 0));
     }
 
-    /** Dibuja el cuadro: el fondo y la imagen encima, aumentada z veces desde el centro. */
+    /** Cómo se ve el texto en un cuadro concreto de su animación. */
+    static final class AnimTexto {
+        float alfa = 1f;
+        float dx = 0f;
+        float dy = 0f;
+        float escala = 1f;
+        int letras = -1; // cuántas letras se ven; -1 todas
+
+        void reiniciar() {
+            alfa = 1f;
+            dx = 0f;
+            dy = 0f;
+            escala = 1f;
+            letras = -1;
+        }
+    }
+
+    /** El texto de una imagen, ya medido y listo para dibujarse entero o letra por letra. */
+    static final class Rotulo {
+        final Bitmap bmp;
+        final String texto;
+        final float cx;
+        final float cy;
+        private final Canvas cv;
+        private final StaticLayout lay;
+        private final TextPaint tp;
+        private final float margenX;
+        private final float y;
+        private final float relleno;
+        private final RectF franja;
+        private final Paint fp;
+        private int dibujados = -2;
+
+        Rotulo(Bitmap bmp, String texto, StaticLayout lay, TextPaint tp, float margenX, float y,
+                float relleno, RectF franja, Paint fp) {
+            this.bmp = bmp;
+            this.texto = texto;
+            this.cv = new Canvas(bmp);
+            this.lay = lay;
+            this.tp = tp;
+            this.margenX = margenX;
+            this.y = y;
+            this.relleno = relleno;
+            this.franja = franja;
+            this.fp = fp;
+            this.cx = bmp.getWidth() / 2f;
+            this.cy = y + lay.getHeight() / 2f;
+        }
+
+        /** Dibuja en la capa las primeras n letras del texto (todas si n es -1 o más que el texto). */
+        void dibujar(int n) {
+            if (n == dibujados) return;
+            dibujados = n;
+            bmp.eraseColor(Color.TRANSPARENT);
+            if (franja != null) cv.drawRoundRect(franja, relleno, relleno, fp);
+            if (n < 0 || n >= texto.length()) {
+                cv.save();
+                cv.translate(margenX, y);
+                lay.draw(cv);
+                cv.restore();
+                return;
+            }
+            for (int i = 0; i < lay.getLineCount(); i++) {
+                int ini = lay.getLineStart(i);
+                if (ini >= n) break;
+                int fin = Math.min(lay.getLineEnd(i), n);
+                while (fin > ini && Character.isWhitespace(texto.charAt(fin - 1))) fin--;
+                if (fin <= ini) continue;
+                cv.drawText(texto, ini, fin, margenX + lay.getLineLeft(i), y + lay.getLineBaseline(i),
+                        tp);
+            }
+        }
+
+        void liberar() {
+            bmp.recycle();
+        }
+    }
+
+    // ---------- Animaciones del texto ----------
+
+    static boolean hayAnimTexto(List<Imagen> imagenes) {
+        for (Imagen im : imagenes) {
+            if (im.rotuloAnim != 0 && im.rotulo != null && !im.rotulo.trim().isEmpty()) return true;
+        }
+        return false;
+    }
+
+    private static double durEntrada(int anim, int letras, double dur) {
+        if (anim == ANIM_ESCRIBIR) {
+            return Math.max(0.2, Math.min(letras / 18.0, Math.min(8.0, dur * 0.7)));
+        }
+        return Math.min(0.7, dur * 0.4);
+    }
+
+    private static double durSalida(double dur) {
+        return Math.min(0.6, dur * 0.3);
+    }
+
+    /** Cuántos cuadros dura la entrada del texto y cuántos su salida (0 si no hay). */
+    static long[] cuadrosAnimTexto(Imagen im, Rotulo r, long cuantos, int fps) {
+        long[] v = {0, 0};
+        if (r == null || im.rotuloAnim == 0) return v;
+        double dur = cuantos / (double) fps;
+        v[0] = Math.min(cuantos, (long) Math.ceil(durEntrada(im.rotuloAnim, r.texto.length(), dur)
+                * fps) + 1);
+        if (im.rotuloAnim == ANIM_FUNDIDO_SALIDA) {
+            v[1] = Math.min(cuantos, (long) Math.ceil(durSalida(dur) * fps) + 1);
+        }
+        return v;
+    }
+
+    /** Calcula cómo se ve el texto en el cuadro rel de la imagen, que tiene cuantos cuadros. */
+    static void animar(Imagen im, long rel, long cuantos, int fps, Rotulo r, AnimTexto a) {
+        a.reiniciar();
+        if (r == null || im.rotuloAnim == 0) return;
+        double dur = cuantos / (double) fps;
+        double t = rel / (double) fps;
+        double entra = durEntrada(im.rotuloAnim, r.texto.length(), dur);
+        double p = entra <= 0 ? 1.0 : Math.min(1.0, t / entra);
+        double s = p * p * (3 - 2 * p);
+        switch (im.rotuloAnim) {
+            case 1:
+                a.alfa = (float) s;
+                break;
+            case 2: {
+                double sal = durSalida(dur);
+                double q = sal <= 0 ? 1.0 : Math.max(0.0, Math.min(1.0, (dur - t) / sal));
+                double sq = q * q * (3 - 2 * q);
+                a.alfa = (float) Math.min(s, sq);
+                break;
+            }
+            case 3:
+                a.alfa = (float) s;
+                a.dy = (float) ((1 - s) * r.bmp.getHeight() * 0.10);
+                break;
+            case 4:
+                a.alfa = (float) s;
+                a.dx = (float) (-(1 - s) * r.bmp.getWidth() * 0.5);
+                break;
+            case ANIM_ESCRIBIR:
+                a.letras = (int) Math.ceil(p * r.texto.length());
+                break;
+            case 6:
+                a.alfa = (float) s;
+                a.escala = (float) (0.6 + 0.4 * s);
+                break;
+            default:
+                break;
+        }
+    }
+
+    // ---------- Transiciones visuales entre imágenes ----------
+
+    /**
+     * Mezcla la imagen que sale con la que entra. p va de 0 (solo la que sale) a 1 (solo la que entra).
+     * El resultado queda en dest.
+     */
+    private static void mezclarTransicion(int tipo, float p, Bitmap entra, Bitmap sale, Bitmap dest,
+            int w, int h) {
+        float s = p * p * (3 - 2 * p);
+        Canvas cv = new Canvas(dest);
+        Paint pt = new Paint(Paint.FILTER_BITMAP_FLAG);
+        cv.drawColor(Color.BLACK);
+        switch (tipo) {
+            case 1:
+                cv.drawBitmap(sale, 0, 0, null);
+                pt.setAlpha(Math.round(255f * s));
+                cv.drawBitmap(entra, 0, 0, pt);
+                break;
+            case 2:
+                if (p < 0.5f) {
+                    pt.setAlpha(Math.round(255f * (1f - p * 2f)));
+                    cv.drawBitmap(sale, 0, 0, pt);
+                } else {
+                    pt.setAlpha(Math.round(255f * (p - 0.5f) * 2f));
+                    cv.drawBitmap(entra, 0, 0, pt);
+                }
+                break;
+            case 3:
+                cv.drawBitmap(sale, -s * w, 0, null);
+                cv.drawBitmap(entra, (1f - s) * w, 0, null);
+                break;
+            case 4:
+                cv.drawBitmap(sale, 0, -s * h, null);
+                cv.drawBitmap(entra, 0, (1f - s) * h, null);
+                break;
+            default:
+                cv.drawBitmap(sale, 0, 0, null);
+                cv.save();
+                cv.clipRect(0, 0, Math.round(s * w), h);
+                cv.drawBitmap(entra, 0, 0, null);
+                cv.restore();
+                break;
+        }
+    }
+
+    /** Dibuja el cuadro: el fondo, la imagen aumentada z veces desde el centro y el texto encima. */
     private static void dibujarPrimerPlano(Bitmap src, Bitmap fondo, Bitmap dest, int w, int h,
-            int modo, float z, Bitmap capa) {
+            int modo, float z, Rotulo rot, AnimTexto an) {
         Canvas cv = new Canvas(dest);
         Paint pt = new Paint(Paint.FILTER_BITMAP_FLAG | Paint.ANTI_ALIAS_FLAG);
         cv.drawBitmap(fondo, 0, 0, null);
@@ -355,20 +578,31 @@ final class Video {
         float dh = sh * s * z;
         cv.drawBitmap(src, null, new RectF((w - dw) / 2, (h - dh) / 2, (w + dw) / 2,
                 (h + dh) / 2), pt);
-        if (capa != null) cv.drawBitmap(capa, 0, 0, null);
+        if (rot == null) return;
+        rot.dibujar(an == null ? -1 : an.letras);
+        float alfa = an == null ? 1f : an.alfa;
+        if (alfa <= 0.01f) return;
+        Paint pc = new Paint(Paint.FILTER_BITMAP_FLAG);
+        pc.setAlpha(Math.round(255f * Math.min(1f, alfa)));
+        cv.save();
+        if (an != null) {
+            cv.translate(an.dx, an.dy);
+            if (an.escala != 1f) cv.scale(an.escala, an.escala, rot.cx, rot.cy);
+        }
+        cv.drawBitmap(rot.bmp, 0, 0, pc);
+        cv.restore();
     }
 
     /**
-     * Dibuja el texto de una imagen en una capa transparente del tamaño del cuadro. Devuelve null si la
-     * imagen no tiene texto. Si el texto es largo, el tamaño se reduce solo hasta que quepa. En videos
-     * verticales el texto se separa más de los bordes de arriba y de abajo, donde las plataformas
-     * ponen sus propios botones y textos.
+     * Prepara el texto de una imagen en una capa transparente del tamaño del cuadro. Devuelve null si
+     * la imagen no tiene texto. Si el texto es largo, el tamaño se reduce solo hasta que quepa. En
+     * videos verticales el texto se separa más de los bordes de arriba y de abajo, donde las
+     * plataformas ponen sus propios botones y textos.
      */
-    static Bitmap capaTexto(Imagen im, int w, int h) {
+    static Rotulo rotulo(Imagen im, int w, int h) {
         String t = im.rotulo == null ? "" : im.rotulo.trim();
         if (t.isEmpty()) return null;
         Bitmap capa = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
-        Canvas cv = new Canvas(capa);
         int lado = Math.min(w, h);
         float[] fracciones = {1f / 22f, 1f / 16f, 1f / 11f};
         float tam = lado * fracciones[Math.max(0, Math.min(2, im.rotuloTam))];
@@ -401,6 +635,8 @@ final class Video {
         } else {
             y = h - margenY - relleno - lay.getHeight();
         }
+        RectF franja = null;
+        Paint fp = null;
         if (im.rotuloFondo) {
             float maxLinea = 0f;
             for (int i = 0; i < lay.getLineCount(); i++) {
@@ -408,16 +644,11 @@ final class Video {
             }
             float caja = maxLinea + 2 * relleno;
             float x0 = (w - caja) / 2f;
-            Paint fp = new Paint(Paint.ANTI_ALIAS_FLAG);
+            fp = new Paint(Paint.ANTI_ALIAS_FLAG);
             fp.setColor(colorFranja(im));
-            cv.drawRoundRect(new RectF(x0, y - relleno, x0 + caja, y + lay.getHeight() + relleno),
-                    relleno, relleno, fp);
+            franja = new RectF(x0, y - relleno, x0 + caja, y + lay.getHeight() + relleno);
         }
-        cv.save();
-        cv.translate(margenX, y);
-        lay.draw(cv);
-        cv.restore();
-        return capa;
+        return new Rotulo(capa, t, lay, tp, margenX, y, relleno, franja, fp);
     }
 
     static boolean hayZoom(List<Imagen> imagenes) {
@@ -530,21 +761,29 @@ final class Video {
 
     /**
      * Crea el video. audioM4a es el audio ya codificado; durSeg trae la duración de cada imagen
-     * en segundos; totalSeg es lo que dura el audio (y el video). Si alguna imagen tiene zoom, o si
-     * hay destello (flash mayor que 0, de 1 a 3), el video se crea a más cuadros por segundo. Mientras
-     * una imagen está quieta se envían pocos cuadros, para que el video no tarde de más.
+     * en segundos; totalSeg es lo que dura el audio (y el video). Si hay zoom, destello, transiciones
+     * visuales o texto animado, el video se crea a más cuadros por segundo. Mientras una imagen está
+     * quieta se envían pocos cuadros, para que el video no tarde de más.
+     *
+     * transVis es la transición visual entre imágenes (0 ninguna) y transDur su duración (0 a 2). La
+     * transición empieza en el momento exacto en que cambia la imagen, igual que el sonido y el
+     * destello, y dura como máximo la mitad de lo que dura la imagen nueva.
      */
     static void crear(Context c, List<Imagen> imagenes, double[] durSeg, File audioM4a,
-            double totalSeg, int formato, int encuadre, int flash, File salida, File temporal,
-            Audio.Progreso prog, Audio.Cancelado can) throws Exception {
+            double totalSeg, int formato, int encuadre, int flash, int transVis, int transDur,
+            File salida, File temporal, Audio.Progreso prog, Audio.Cancelado can) throws Exception {
         final int w = TAMANOS[formato][0];
         final int h = TAMANOS[formato][1];
         final boolean conZoom = hayZoom(imagenes);
         final boolean conFlash = flash > 0 && imagenes.size() > 1;
-        final boolean conMov = conZoom || conFlash;
+        final boolean conTransVis = transVis > 0 && imagenes.size() > 1;
+        final boolean conAnimTexto = hayAnimTexto(imagenes);
+        final boolean conMov = conZoom || conFlash || conTransVis || conAnimTexto;
         final int fps = conMov ? FPS_ZOOM : FPS;
         final int paso = Math.max(1, fps / FPS);
         final float picoFlash = PICO_FLASH[limitar(flash, 0, PICO_FLASH.length - 1)];
+        final int cuadrosTrans = (int) Math.round(
+                SEG_TRANSICION[limitar(transDur, 0, SEG_TRANSICION.length - 1)] * fps);
         final long totalMarcos = Math.max(1, Math.round(totalSeg * fps));
         int cuantas = imagenes.size();
 
@@ -561,7 +800,8 @@ final class Video {
         MediaFormat f = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h);
         f.setInteger(MediaFormat.KEY_COLOR_FORMAT,
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible);
-        f.setInteger(MediaFormat.KEY_BIT_RATE, conZoom ? 3000000 : (conFlash ? 2000000 : 1000000));
+        f.setInteger(MediaFormat.KEY_BIT_RATE,
+                (conZoom || conTransVis) ? 3000000 : (conMov ? 2000000 : 1000000));
         f.setInteger(MediaFormat.KEY_FRAME_RATE, fps);
         f.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, conMov ? 2 : 5);
         f.setInteger(MediaFormat.KEY_BITRATE_MODE,
@@ -606,7 +846,19 @@ final class Video {
             byte[] vv = new byte[w * h / 4];
             int[] px = new int[w * h];
             Bitmap cuadro = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
-            Bitmap fondo = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+            Bitmap fondoA = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+            // Solo con transición visual hacen falta dos fondos, un cuadro de mezcla y otro con la
+            // imagen que sale.
+            Bitmap fondoB = conTransVis ? Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888) : null;
+            Bitmap mezcla = conTransVis ? Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888) : null;
+            Bitmap saliente = conTransVis ? Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888) : null;
+            Bitmap prevSrc = null;
+            Bitmap prevFondo = null;
+            Rotulo prevRot = null;
+            Imagen prevIm = null;
+            long prevCuantos = 0;
+            int prevZoom = 0;
+            final AnimTexto an = new AnimTexto();
             long cuadroActual = 0;
             int ultimoPct = -1;
             boolean eos = false;
@@ -619,40 +871,74 @@ final class Video {
                 boolean zoomea = im.zoom != 0;
                 // Con zoom se carga la imagen más grande, para que al acercarla no se vea borrosa.
                 Bitmap src = cargar(c, im.uri, zoomea ? Math.max(w, h) * 3 / 2 : Math.max(w, h));
+                Bitmap fondo = (conTransVis && prevFondo == fondoA) ? fondoB : fondoA;
                 dibujarFondo(src, fondo, w, h, encuadre);
-                final Bitmap capa = capaTexto(im, w, h);
+                final Rotulo rot = rotulo(im, w, h);
                 final long ini = cuadroActual;
                 final long cuantos = fin - ini;
                 // El destello ilumina la imagen nueva cada vez que cambia (no la primera).
                 final int nFlash = (conFlash && k > 0)
                         ? Math.max(2, (int) Math.round(DUR_FLASH * fps)) : 0;
+                // La transición visual ocupa los primeros cuadros de la imagen nueva.
+                int nTr = 0;
+                if (conTransVis && k > 0 && prevSrc != null) {
+                    nTr = (int) Math.min(cuadrosTrans, cuantos / 2);
+                    if (nTr < 2) nTr = 0;
+                }
+                if (nTr > 0) {
+                    // La imagen que sale, tal como quedó en su último cuadro.
+                    float zFin = prevZoom == 1 ? (float) (1 + ZOOM_MAX) : 1f;
+                    animar(prevIm, prevCuantos - 1, prevCuantos, fps, prevRot, an);
+                    dibujarPrimerPlano(prevSrc, prevFondo, saliente, w, h, encuadre, zFin, prevRot,
+                            an);
+                }
+                final long[] ventAnim = cuadrosAnimTexto(im, rot, cuantos, fps);
+                final long inicioSalida = ventAnim[1] > 0 ? fin - ventAnim[1] : Long.MAX_VALUE;
                 boolean baseLista = false;
                 while (cuadroActual < fin) {
                     if (can != null && can.si()) throw new Audio.Cancelacion();
                     int i = enc.dequeueInputBuffer(10000);
                     if (i >= 0) {
                         final long rel = cuadroActual - ini;
+                        final boolean animaTexto = rot != null && im.rotuloAnim != 0
+                                && (rel < ventAnim[0] || cuadroActual >= inicioSalida);
+                        final boolean enTrans = rel < nTr;
+                        final boolean enFlash = rel < nFlash;
                         long salto = 1;
-                        if (zoomea) {
-                            double t = cuantos <= 1 ? 0 : (cuadroActual - ini) / (double) (cuantos - 1);
-                            double s = t * t * (3 - 2 * t);
-                            double z = im.zoom == 1 ? 1 + ZOOM_MAX * s : 1 + ZOOM_MAX * (1 - s);
-                            dibujarPrimerPlano(src, fondo, cuadro, w, h, encuadre, (float) z, capa);
-                            if (rel < nFlash) aplicarFlash(cuadro, alfaFlash(rel, nFlash, picoFlash));
-                            aYuv(cuadro, w, h, px, yy, uu, vv);
-                        } else if (rel < nFlash) {
-                            dibujarPrimerPlano(src, fondo, cuadro, w, h, encuadre, 1f, capa);
-                            aplicarFlash(cuadro, alfaFlash(rel, nFlash, picoFlash));
-                            aYuv(cuadro, w, h, px, yy, uu, vv);
+                        if (zoomea || animaTexto || enTrans || enFlash) {
                             baseLista = false;
+                            float z = 1f;
+                            if (zoomea) {
+                                double t = cuantos <= 1 ? 0
+                                        : (cuadroActual - ini) / (double) (cuantos - 1);
+                                double s = t * t * (3 - 2 * t);
+                                z = (float) (im.zoom == 1 ? 1 + ZOOM_MAX * s
+                                        : 1 + ZOOM_MAX * (1 - s));
+                            }
+                            animar(im, rel, cuantos, fps, rot, an);
+                            dibujarPrimerPlano(src, fondo, cuadro, w, h, encuadre, z, rot, an);
+                            Bitmap listo = cuadro;
+                            if (enTrans) {
+                                mezclarTransicion(transVis, (rel + 1f) / (nTr + 1f), cuadro,
+                                        saliente, mezcla, w, h);
+                                listo = mezcla;
+                            }
+                            if (enFlash) aplicarFlash(listo, alfaFlash(rel, nFlash, picoFlash));
+                            aYuv(listo, w, h, px, yy, uu, vv);
                         } else {
                             if (!baseLista) {
-                                dibujarPrimerPlano(src, fondo, cuadro, w, h, encuadre, 1f, capa);
+                                an.reiniciar();
+                                dibujarPrimerPlano(src, fondo, cuadro, w, h, encuadre, 1f, rot, an);
                                 aYuv(cuadro, w, h, px, yy, uu, vv);
                                 baseLista = true;
                             }
-                            // Imagen quieta: basta con pocos cuadros por segundo.
-                            salto = Math.max(1, Math.min(paso, fin - cuadroActual));
+                            // Imagen quieta: basta con pocos cuadros por segundo, pero sin pasarse
+                            // del momento en que empieza la salida del texto.
+                            long limite = fin - cuadroActual;
+                            if (inicioSalida != Long.MAX_VALUE && inicioSalida > cuadroActual) {
+                                limite = Math.min(limite, inicioSalida - cuadroActual);
+                            }
+                            salto = Math.max(1, Math.min(paso, limite));
                         }
                         Image im2 = enc.getInputImage(i);
                         if (im2 == null) {
@@ -678,8 +964,20 @@ final class Video {
                         }
                     }
                 }
-                src.recycle();
-                if (capa != null) capa.recycle();
+                if (conTransVis) {
+                    // Esta imagen se queda para la transición de la siguiente.
+                    if (prevSrc != null) prevSrc.recycle();
+                    if (prevRot != null) prevRot.liberar();
+                    prevSrc = src;
+                    prevFondo = fondo;
+                    prevRot = rot;
+                    prevIm = im;
+                    prevCuantos = cuantos;
+                    prevZoom = im.zoom;
+                } else {
+                    src.recycle();
+                    if (rot != null) rot.liberar();
+                }
             }
             if (cuadroActual < totalMarcos) {
                 throw new Exception("No pude completar el video. Revisa las imágenes elegidas.");
@@ -688,7 +986,12 @@ final class Video {
                 if (can != null && can.si()) throw new Audio.Cancelacion();
             }
             cuadro.recycle();
-            fondo.recycle();
+            fondoA.recycle();
+            if (fondoB != null) fondoB.recycle();
+            if (mezcla != null) mezcla.recycle();
+            if (saliente != null) saliente.recycle();
+            if (prevSrc != null) prevSrc.recycle();
+            if (prevRot != null) prevRot.liberar();
             muxIniciado = est[1] == 1;
         } finally {
             if (enc != null) {

@@ -70,6 +70,133 @@ final class Audio {
         boolean desvanecer = true;
         int introSeg = 0;
         int outroSeg = 0;
+        /** Bajada automática de la música cuando se oye la voz (sugerencia de Rubicel Ruiz). */
+        boolean duck = false;
+        /** Cuánto suena la música mientras se oye la voz, en porcentaje de su volumen normal. */
+        int duckNivel = 30;
+        /** Sensibilidad a la voz, de 1 (solo voz fuerte) a 5 (también voz muy baja). */
+        int duckSens = 3;
+    }
+
+    // ---------- Bajada automática de la música ----------
+
+    /** Una ventana de análisis dura una centésima de segundo (441 marcos a 44100 Hz). */
+    private static final int VENT = 441;
+    /** La música empieza a bajar 0,2 segundos antes de que entre la voz. */
+    private static final int DUCK_ADELANTO = 20;
+    /** Después de la última voz, la música espera 0,45 segundos antes de volver a subir. */
+    private static final int DUCK_ESPERA = 45;
+    /** Tiempo que tarda en bajar: 0,15 segundos. */
+    private static final int DUCK_BAJADA = 15;
+    /** Tiempo que tarda en volver a subir: 0,8 segundos. */
+    private static final int DUCK_SUBIDA = 80;
+
+    private static String duckClave = null;
+    private static float[] duckEnv = null;
+
+    /** Detecta si el audio de la voz suena en cada centésima de segundo. */
+    private static float[] envolventeDuck(File voz, Ajustes a, Cancelado can) throws Exception {
+        final long marcosVoz = voz.length() / BYTES_MARCO;
+        final long intro = (long) a.introSeg * HZ;
+        final long total = totalMezcla(voz, a);
+        final int nVent = (int) (total / VENT) + 3;
+        final String clave = voz.getAbsolutePath() + "|" + voz.length() + "|" + voz.lastModified()
+                + "|" + a.introSeg + "|" + a.outroSeg + "|" + a.duckNivel + "|" + a.duckSens;
+        synchronized (Audio.class) {
+            if (clave.equals(duckClave) && duckEnv != null) return duckEnv;
+        }
+
+        // 1. Volumen de la voz en cada ventana, en decibelios.
+        final float[] db = new float[nVent];
+        Arrays.fill(db, -120f);
+        final int[] hist = new int[121];
+        final int bloqueVent = 200;
+        short[] buf = new short[VENT * bloqueVent * 2];
+        int w = (int) (intro / VENT);
+        try (Lector l = new Lector(voz)) {
+            long restantes = marcosVoz;
+            while (restantes > 0) {
+                if (can != null && can.si()) throw new Cancelacion();
+                int n = l.leer(buf, 0, (int) Math.min((long) VENT * bloqueVent, restantes));
+                if (n <= 0) break;
+                restantes -= n;
+                for (int ini = 0; ini < n; ini += VENT) {
+                    int len = Math.min(VENT, n - ini);
+                    double suma = 0;
+                    for (int i = 2 * ini; i < 2 * (ini + len); i++) {
+                        double v = buf[i];
+                        suma += v * v;
+                    }
+                    double rms = Math.sqrt(suma / (2.0 * len)) / 32768.0;
+                    float d = (float) (20.0 * Math.log10(rms + 1e-6));
+                    if (d < -120f) d = -120f;
+                    if (w < nVent) {
+                        db[w] = d;
+                        hist[Math.max(0, Math.min(120, (int) Math.round(d) + 120))]++;
+                    }
+                    w++;
+                }
+            }
+        }
+
+        // 2. Nivel de la voz fuerte (el 5 por ciento más alto de lo que no es silencio).
+        long conSonido = 0;
+        for (int b = 40; b <= 120; b++) conSonido += hist[b]; // de -80 dB hacia arriba
+        float[] env = new float[nVent];
+        Arrays.fill(env, 1f);
+        final float piso = Math.max(0.05f, Math.min(1f, a.duckNivel / 100f));
+        if (conSonido > 0 && piso < 1f) {
+            long cuenta = 0;
+            int nivel = 120;
+            final long objetivo = Math.max(1, conSonido / 20);
+            for (int b = 120; b >= 40; b--) {
+                cuenta += hist[b];
+                if (cuenta >= objetivo) {
+                    nivel = b;
+                    break;
+                }
+            }
+            double fuerte = nivel - 120;
+            double umbral = Math.max(-55.0, fuerte - (14 + 3 * Math.max(1, Math.min(5, a.duckSens))));
+
+            // 3. Dónde hay voz, con adelanto y con espera.
+            boolean[] activa = new boolean[nVent];
+            for (int i = 0; i < nVent; i++) activa[i] = db[i] > umbral;
+            int[] hastaVoz = new int[nVent];
+            int dist = Integer.MAX_VALUE / 2;
+            for (int i = nVent - 1; i >= 0; i--) {
+                dist = activa[i] ? 0 : dist + 1;
+                hastaVoz[i] = dist;
+            }
+            final float pasoBaja = (1f - piso) / DUCK_BAJADA;
+            final float pasoSube = (1f - piso) / DUCK_SUBIDA;
+            int desdeVoz = Integer.MAX_VALUE / 2;
+            float g = 1f;
+            for (int i = 0; i < nVent; i++) {
+                desdeVoz = activa[i] ? 0 : desdeVoz + 1;
+                boolean baja = hastaVoz[i] <= DUCK_ADELANTO || desdeVoz <= DUCK_ESPERA;
+                if (baja) {
+                    g = Math.max(piso, g - pasoBaja);
+                } else {
+                    g = Math.min(1f, g + pasoSube);
+                }
+                env[i] = g;
+            }
+        }
+        synchronized (Audio.class) {
+            duckClave = clave;
+            duckEnv = env;
+        }
+        return env;
+    }
+
+    /** La ganancia de la música en el marco q, interpolando entre dos ventanas. */
+    private static double gananciaDuck(float[] env, long q) {
+        int w = (int) (q / VENT);
+        if (w < 0) return 1.0;
+        if (w + 1 >= env.length) return env[env.length - 1];
+        double fr = (q % VENT) / (double) VENT;
+        return env[w] * (1.0 - fr) + env[w + 1] * fr;
     }
 
     // ---------- Decodificar cualquier audio a PCM de trabajo ----------
@@ -386,6 +513,7 @@ final class Audio {
         short[] sal = new short[bloque * 2];
         int pico = 0;
         int ultimoPct = -1;
+        final float[] bajada = a.duck ? envolventeDuck(vozPcm, a, can) : null;
         try (Lector lv = new Lector(vozPcm); Lector lm = new Lector(musPcm)) {
             if (desde - intro > 0) lv.buscar(desde - intro);
             if (lm.marcos > 0) {
@@ -420,6 +548,7 @@ final class Audio {
                         if (r < fOut) g = Math.min(g, (double) r / fOut);
                     }
                     double gm = gM * g;
+                    if (bajada != null) gm *= gananciaDuck(bajada, q);
                     for (int ch = 0; ch < 2; ch++) {
                         double v = bv[2 * i + ch] * gV + bm[2 * i + ch] * gm;
                         int ab = (int) Math.abs(v);
@@ -553,6 +682,62 @@ final class Audio {
             throw ex;
         }
         if (prog != null) prog.porcentaje(100);
+    }
+
+    /** Pasa un PCM de trabajo a un archivo WAV sin compresión. */
+    static void pcmAWav(File pcm, File destino, Progreso prog, Cancelado can) throws Exception {
+        long total = pcm.length() / BYTES_MARCO;
+        try (FileInputStream in = new FileInputStream(pcm);
+                OutputStream os = new BufferedOutputStream(new FileOutputStream(destino), 1 << 16)) {
+            os.write(cabeceraWav(total * BYTES_MARCO));
+            byte[] buf = new byte[1 << 16];
+            long hecho = 0;
+            long limite = total * BYTES_MARCO;
+            int ultimoPct = -1;
+            int n;
+            while (hecho < limite && (n = in.read(buf, 0, (int) Math.min(buf.length, limite - hecho))) > 0) {
+                if (can != null && can.si()) throw new Cancelacion();
+                os.write(buf, 0, n);
+                hecho += n;
+                if (prog != null && limite > 0) {
+                    int pct = (int) Math.min(99, hecho * 100 / limite);
+                    if (pct != ultimoPct) {
+                        ultimoPct = pct;
+                        prog.porcentaje(pct);
+                    }
+                }
+            }
+        }
+        if (prog != null) prog.porcentaje(100);
+    }
+
+    /** Un tramo de hasta segundos segundos del audio de trabajo, desde el marco indicado. */
+    static short[] tramo(File pcm, long desdeMarco, int segundos) throws Exception {
+        long total = pcm.length() / BYTES_MARCO;
+        long desde = Math.max(0, Math.min(desdeMarco, total));
+        int n = (int) Math.max(0, Math.min((long) segundos * HZ, total - desde));
+        short[] datos = new short[n * 2];
+        try (Lector l = new Lector(pcm)) {
+            l.buscar(desde);
+            l.leer(datos, 0, n);
+        }
+        return datos;
+    }
+
+    /** El pico más alto del audio de trabajo, de 0 a 32768. */
+    static int picoPcm(File pcm) throws Exception {
+        int pico = 0;
+        short[] b = new short[8192 * 2];
+        try (Lector l = new Lector(pcm)) {
+            int n;
+            while ((n = l.leer(b, 0, 8192)) > 0) {
+                for (int i = 0; i < n * 2; i++) {
+                    int v = Math.abs((int) b[i]);
+                    if (v > pico) pico = v;
+                }
+            }
+        }
+        return pico;
     }
 
     // ---------- Codificador AAC ----------

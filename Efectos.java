@@ -23,6 +23,8 @@ final class Efectos {
     static final int CUEVA = 4;
     static final int TELEFONO = 5;
     static final int DUO = 6;
+    /** Desde aquí, cada efecto es un preset del ecualizador. */
+    static final int EQ0 = 7;
 
     static final String[] NOMBRES = {
         "Ardilla: voz muy aguda",
@@ -31,7 +33,14 @@ final class Efectos {
         "Eco: la voz se repite",
         "Cueva: sonido de lugar enorme",
         "Teléfono o radio antigua",
-        "Dúo: la voz suena doble"
+        "Dúo: la voz suena doble",
+        "Ecualizador, voz clara: más claridad y presencia",
+        "Ecualizador, voz cálida: más cuerpo, estilo radio",
+        "Ecualizador, más graves",
+        "Ecualizador, más agudos: más brillo",
+        "Ecualizador, menos graves: quita el retumbo",
+        "Ecualizador, realzar los medios: se entiende mejor",
+        "Ecualizador, música con fuerza: graves y agudos realzados"
     };
 
     static final String[] DESCRIPCIONES = {
@@ -46,7 +55,22 @@ final class Efectos {
                 + "sin graves, sin agudos y un poco áspera.",
         "Duplica la voz con una segunda voz casi igual, apenas retrasada y con un poco de "
                 + "diferencia de tono, como si dos personas dijeran lo mismo a la vez. Da cuerpo "
-                + "a una voz sola."
+                + "a una voz sola.",
+        "Preset de ecualizador. Realza la zona donde se distinguen las consonantes y quita un poco "
+                + "de graves, para que la voz suene más clara y cercana. Funciona bien en voces "
+                + "grabadas con el teléfono.",
+        "Preset de ecualizador. Da cuerpo a la voz con más graves suaves y quita un poco de "
+                + "agudos ásperos, como una voz de locutor de radio.",
+        "Preset de ecualizador. Refuerza los sonidos graves, útil para música o para dar peso a una "
+                + "voz delgada.",
+        "Preset de ecualizador. Realza los sonidos agudos para que el audio suene más abierto y "
+                + "brillante, útil cuando se oye apagado.",
+        "Preset de ecualizador. Baja los graves para quitar el retumbo, el zumbido de fondo y el "
+                + "ruido del viento en grabaciones hechas con el teléfono.",
+        "Preset de ecualizador. Realza la zona media, que es donde está la mayor parte de la voz, "
+                + "para entender mejor lo que se dice aunque haya ruido o música de fondo.",
+        "Preset de ecualizador para música. Sube los graves y los agudos y baja un poco los medios, "
+                + "para que la música suene potente y con brillo."
     };
 
     static int limitar(int intensidad) {
@@ -87,8 +111,12 @@ final class Efectos {
             case DUO:
                 return base + "la segunda voz se nota " + grado(i) + " y llega "
                         + retardoDuoMs(i) + " milésimas de segundo después de la original.";
-            default:
+            case TELEFONO:
                 return base + "voz de teléfono antiguo, " + grado(i) + " marcada.";
+            default:
+                return base + "el volumen de algunas zonas del sonido cambia hasta "
+                        + dec(maxDbEq(efecto - EQ0, i)) + " decibelios, un efecto " + grado(i)
+                        + " marcado.";
         }
     }
 
@@ -192,10 +220,15 @@ final class Efectos {
                     c[1] = new Duo(i, Math.PI, 3);
                     cl = HZ / 8;
                     break;
-                default:
+                case TELEFONO:
                     c[0] = new Telefono(i);
                     c[1] = new Telefono(i);
                     cl = HZ / 5;
+                    break;
+                default:
+                    c[0] = new Ecualizador(efecto - EQ0, i);
+                    c[1] = new Ecualizador(efecto - EQ0, i);
+                    cl = HZ / 10;
                     break;
             }
             cola = cl;
@@ -478,6 +511,124 @@ final class Efectos {
             double n = y / 32768.0;
             double s = Math.tanh(empuje * n) / norma;
             return (float) (s * 32768.0);
+        }
+    }
+
+    // ---------- Ecualizador con presets ----------
+
+    private static final int PICO = 0;
+    private static final int GRAVES = 1;
+    private static final int AGUDOS = 2;
+
+    /**
+     * Cada preset es una lista de bandas: tipo, frecuencia en hertz, cambio en decibelios con la
+     * intensidad 5, y ancho (Q). Una intensidad menor aplica menos cambio y una mayor aplica más.
+     */
+    private static final double[][][] PRESETS = {
+        // Voz clara
+        {{PICO, 3000, 4.0, 1.0}, {AGUDOS, 8000, 3.0, 0.7}, {GRAVES, 110, -4.0, 0.7}},
+        // Voz cálida
+        {{GRAVES, 150, 5.0, 0.7}, {PICO, 2500, 2.0, 0.9}, {AGUDOS, 9000, -2.5, 0.7}},
+        // Más graves
+        {{GRAVES, 100, 7.0, 0.7}, {PICO, 60, 2.0, 1.0}},
+        // Más agudos
+        {{AGUDOS, 5000, 6.0, 0.7}, {PICO, 11000, 2.0, 1.0}},
+        // Menos graves
+        {{GRAVES, 160, -8.0, 0.7}, {PICO, 90, -3.0, 1.0}},
+        // Realzar los medios
+        {{PICO, 1500, 5.0, 0.8}, {PICO, 3000, 3.0, 1.0}, {GRAVES, 90, -2.0, 0.7}},
+        // Música con fuerza
+        {{GRAVES, 100, 5.0, 0.7}, {AGUDOS, 7000, 4.0, 0.7}, {PICO, 800, -2.5, 0.8}}
+    };
+
+    /** El cambio más grande, en decibelios, que hace un preset con esa intensidad. */
+    private static double maxDbEq(int preset, int i) {
+        double m = 0;
+        double[][] bandas = PRESETS[Math.max(0, Math.min(PRESETS.length - 1, preset))];
+        for (double[] b : bandas) m = Math.max(m, Math.abs(b[2]));
+        return m * i / 5.0;
+    }
+
+    /** Un filtro de una banda del ecualizador (fórmulas de Robert Bristow-Johnson). */
+    private static final class Banda {
+        private final double b0;
+        private final double b1;
+        private final double b2;
+        private final double a1;
+        private final double a2;
+        private double z1 = 0;
+        private double z2 = 0;
+
+        Banda(int tipo, double hz, double db, double q) {
+            double aa = Math.pow(10, db / 40.0);
+            double w = 2 * Math.PI * Math.min(hz, HZ * 0.45) / HZ;
+            double cs = Math.cos(w);
+            double sn = Math.sin(w);
+            double n0;
+            double n1;
+            double n2;
+            double d0;
+            double d1;
+            double d2;
+            if (tipo == PICO) {
+                double alfa = sn / (2 * q);
+                n0 = 1 + alfa * aa;
+                n1 = -2 * cs;
+                n2 = 1 - alfa * aa;
+                d0 = 1 + alfa / aa;
+                d1 = -2 * cs;
+                d2 = 1 - alfa / aa;
+            } else {
+                double alfa = sn / 2 * Math.sqrt(2);
+                double raiz = 2 * Math.sqrt(aa) * alfa;
+                if (tipo == GRAVES) {
+                    n0 = aa * ((aa + 1) - (aa - 1) * cs + raiz);
+                    n1 = 2 * aa * ((aa - 1) - (aa + 1) * cs);
+                    n2 = aa * ((aa + 1) - (aa - 1) * cs - raiz);
+                    d0 = (aa + 1) + (aa - 1) * cs + raiz;
+                    d1 = -2 * ((aa - 1) + (aa + 1) * cs);
+                    d2 = (aa + 1) + (aa - 1) * cs - raiz;
+                } else {
+                    n0 = aa * ((aa + 1) + (aa - 1) * cs + raiz);
+                    n1 = -2 * aa * ((aa - 1) + (aa + 1) * cs);
+                    n2 = aa * ((aa + 1) + (aa - 1) * cs - raiz);
+                    d0 = (aa + 1) - (aa - 1) * cs + raiz;
+                    d1 = 2 * ((aa - 1) - (aa + 1) * cs);
+                    d2 = (aa + 1) - (aa - 1) * cs - raiz;
+                }
+            }
+            b0 = n0 / d0;
+            b1 = n1 / d0;
+            b2 = n2 / d0;
+            a1 = d1 / d0;
+            a2 = d2 / d0;
+        }
+
+        double proc(double x) {
+            double y = b0 * x + z1;
+            z1 = b1 * x - a1 * y + z2;
+            z2 = b2 * x - a2 * y;
+            return y;
+        }
+    }
+
+    private static final class Ecualizador implements Canal {
+        private final Banda[] bandas;
+
+        Ecualizador(int preset, int intensidad) {
+            double[][] def = PRESETS[Math.max(0, Math.min(PRESETS.length - 1, preset))];
+            bandas = new Banda[def.length];
+            for (int k = 0; k < def.length; k++) {
+                bandas[k] = new Banda((int) def[k][0], def[k][1], def[k][2] * intensidad / 5.0,
+                        def[k][3]);
+            }
+        }
+
+        @Override
+        public float proc(float x) {
+            double y = x;
+            for (Banda b : bandas) y = b.proc(y);
+            return (float) y;
         }
     }
 
