@@ -4,6 +4,10 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Para que la grabación siga al salir de la aplicación (versión 0.7). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <queries>
         <intent>
@@ -41,5 +45,11 @@
                 <data android:mimeType="application/ogg" />
             </intent-filter>
         </activity>
+
+        <!-- Mantiene viva la grabación del micrófono cuando sales de la aplicación. -->
+        <service
+            android:name=".ServicioGrabacion"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
     </application>
 </manifest>

@@ -2,6 +2,7 @@ package com.cafetecnologico.estudio;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
 import android.content.ClipData;
 import android.content.Intent;
@@ -13,6 +14,7 @@ import android.media.AudioAttributes;
 import android.media.AudioFormat;
 import android.media.AudioTrack;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.PowerManager;
 import android.provider.OpenableColumns;
@@ -21,6 +23,8 @@ import android.text.InputFilter;
 import android.text.InputType;
 import android.text.TextWatcher;
 import android.speech.tts.TextToSpeech;
+import android.view.Menu;
+import android.view.MenuItem;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
@@ -47,21 +51,25 @@ import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.IntConsumer;
 import java.util.function.IntSupplier;
 import java.util.function.LongConsumer;
 
 /**
- * Estudio Café Tecnológico, versión 0.6.
+ * Estudio Café Tecnológico, versión 0.7.
  * Interfaz hecha por código, pensada para lectores de pantalla (TalkBack, Jieshuo, Prudence):
  * solo botones y textos claros, sin iconos ni gestos de arrastrar.
  *
- * Funciones: mezclar audio con música de fondo (con bajada automática de la música), crear un video
- * con audio e imágenes (con zoom, texto animado sobre las imágenes, transiciones visuales,
- * descripción de las imágenes, sonido de transición y proyectos guardados), agregar un audio a un
- * video del teléfono, cambiar la voz de un audio con efectos y ecualizador, y transcribir audios a
- * texto. Cada una puede usarse con el asistente (pasos guiados y voz del teléfono) o en modo manual.
+ * Funciones: grabar audio con el micrófono (que sigue grabando aunque salgas de la aplicación),
+ * mezclar audio con música de fondo (con bajada automática de la música y la opción de usar solo un
+ * fragmento de la música), crear un video con audio e imágenes (con zoom, texto animado sobre las
+ * imágenes, transiciones visuales, descripción de las imágenes, sonido de transición, proyectos
+ * guardados y la opción de usar solo un fragmento del audio), agregar un audio a un video del
+ * teléfono, convertir un video en audio, cambiar la voz de un audio con efectos y ecualizador, y
+ * transcribir audios a texto. Cada una puede usarse con el asistente (pasos guiados y voz del
+ * teléfono) o en modo manual. El botón Más opciones, arriba a la derecha, trae Salir.
  */
 public class MainActivity extends Activity {
 
@@ -203,10 +211,46 @@ public class MainActivity extends Activity {
     private int grFormato = 0;
     private String grNombreSalida = "Grabación";
     private boolean grEmpezando = false; // hay una espera antes de grabar
-    private boolean grPausaAuto = false; // la grabación se pausó porque saliste de la aplicación
     private boolean grConfirmaDescartar = false;
     private int grTic = 0;
     private Runnable grRefrescarUi;
+
+    // Estado de la versión 0.7
+    private static final int MENU_SALIR = 1;
+
+    /** Un audio del que se puede usar solo un fragmento (sugerencia de Vivi Beliu, de Argentina). */
+    private static final class Frag {
+        File completo; // el audio entero, tal como se leyó; no se cambia
+        long marcos; // lo que dura el audio entero, en marcos
+        long ini; // dónde empieza el fragmento, en marcos
+        long fin; // dónde termina, en marcos (0: hasta el final)
+        String textoIni = ""; // lo que la persona escribió, para volver a mostrarlo
+        String textoFin = "";
+
+        void nuevo(File completo, long marcos) {
+            this.completo = completo;
+            this.marcos = marcos;
+            ini = 0;
+            fin = 0;
+            textoIni = "";
+            textoFin = "";
+        }
+
+        boolean activo() {
+            return ini > 0 || (fin > 0 && fin < marcos);
+        }
+    }
+
+    private final Frag vdFrag = new Frag(); // audio del video con imágenes
+    private final Frag mzFrag = new Frag(); // música de la mezcla
+    private final Frag avFrag = new Frag(); // audio nuevo para un video del teléfono
+
+    // Convertir un video en audio (sugerencia de Leo, de México)
+    private Uri eaVideoUri;
+    private String eaVideoNombre;
+    private Video.Info eaInfo;
+    private int eaFormato = 0;
+    private String eaNombreSalida = "Audio del video";
 
     // ---------- Ciclo de vida ----------
 
@@ -226,10 +270,84 @@ public class MainActivity extends Activity {
         setContentView(scroll);
 
         limpiarCache();
-        grArchivo().delete();
+        // Si una grabación sigue en curso en segundo plano, su archivo no se toca.
+        if (ServicioGrabacion.grabadora == null) grArchivo().delete();
         iniciarTts();
         mostrarMenu();
+        grRecuperar();
         if (estado == null) recibirCompartido(getIntent());
+    }
+
+    // ---------- Menú Más opciones y salir (sugerencia de Guillermo, de Argentina) ----------
+
+    @Override
+    public boolean onCreateOptionsMenu(Menu menu) {
+        MenuItem salir = menu.add(Menu.NONE, MENU_SALIR, Menu.NONE, "Salir de la aplicación");
+        salir.setShowAsAction(MenuItem.SHOW_AS_ACTION_NEVER);
+        return true;
+    }
+
+    @Override
+    public boolean onOptionsItemSelected(MenuItem item) {
+        if (item.getItemId() == MENU_SALIR) {
+            pedirSalir();
+            return true;
+        }
+        return super.onOptionsItemSelected(item);
+    }
+
+    /** Sale de la aplicación, avisando antes si hay algo que se perdería. */
+    private void pedirSalir() {
+        detenerVista();
+        if (tts != null) tts.stop();
+        if (grGrabando()) {
+            new AlertDialog.Builder(this)
+                    .setTitle("Hay una grabación en curso")
+                    .setMessage("Si sales de la aplicación, ¿qué hago con la grabación?")
+                    .setPositiveButton("Seguir grabando", null)
+                    .setNeutralButton("Terminar y revisar la grabación", (d, w) ->
+                            grTerminar(() -> empezar(this::grPasoRevisar, this::grManual), null))
+                    .setNegativeButton("Descartarla y salir", (d, w) -> cerrarAplicacion())
+                    .show();
+        } else if (grEmpezando) {
+            new AlertDialog.Builder(this)
+                    .setTitle("Estás por empezar a grabar")
+                    .setMessage("Hay una espera antes de empezar la grabación. ¿Qué hago?")
+                    .setPositiveButton("Seguir esperando", null)
+                    .setNegativeButton("Cancelar la grabación y salir", (d, w) -> cerrarAplicacion())
+                    .show();
+        } else if (bloqueo != null) {
+            new AlertDialog.Builder(this)
+                    .setTitle("Hay un trabajo en curso")
+                    .setMessage("Estoy procesando un audio o un video. Si sales ahora, el trabajo "
+                            + "se cancela.")
+                    .setPositiveButton("Esperar a que termine", null)
+                    .setNegativeButton("Cancelar el trabajo y salir", (d, w) -> cerrarAplicacion())
+                    .show();
+        } else if (grMarcos > 0) {
+            new AlertDialog.Builder(this)
+                    .setTitle("Tienes una grabación sin guardar")
+                    .setMessage("Grabaste " + duracion(grMarcos) + " y todavía no la guardaste. Si "
+                            + "sales, se pierde.")
+                    .setPositiveButton("Volver a la aplicación", null)
+                    .setNegativeButton("Salir sin guardarla", (d, w) -> cerrarAplicacion())
+                    .show();
+        } else {
+            cerrarAplicacion();
+        }
+    }
+
+    private void cerrarAplicacion() {
+        cancelar = true;
+        grEmpezando = false;
+        grTic++;
+        if (grabadora != null) {
+            grabadora.descartar();
+            grabadora = null;
+        }
+        ServicioGrabacion.soltar(this);
+        grArchivo().delete();
+        finishAndRemoveTask();
     }
 
     @Override
@@ -243,35 +361,27 @@ public class MainActivity extends Activity {
     protected void onPause() {
         detenerVista();
         if (tts != null) tts.stop();
-        // Al salir de la aplicación Android corta el micrófono: se pausa la grabación para no perderla.
-        if (grabadora != null && grabadora.estado() == Grabadora.GRABANDO) {
-            grabadora.pausar();
-            grPausaAuto = true;
-        }
-        if (grEmpezando) {
-            grEmpezando = false;
-            grTic++;
-            grPausaAuto = true;
-        }
+        // La grabación no se pausa al salir: sigue en segundo plano con el servicio en primer plano.
         super.onPause();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        if (grPausaAuto) {
-            grPausaAuto = false;
-            aviso("La grabación se detuvo un momento porque saliste de la aplicación. Toca "
-                    + "Seguir grabando o Empezar a grabar para continuar.");
-            if (grRefrescarUi != null) grRefrescarUi.run();
-        }
+        // Al volver se pone al día lo que pasó en segundo plano (pausa, tiempo, fin de la grabación).
+        if (grRefrescarUi != null && grGrabando()) grRefrescarUi.run();
     }
 
     @Override
     protected void onDestroy() {
-        if (grabadora != null) {
-            grabadora.detener();
-            grabadora = null;
+        // Si la pantalla se cierra de verdad, la grabación termina. Si solo la cerró Android para
+        // liberar memoria, la grabación sigue en el servicio y se recupera al volver.
+        if (isFinishing()) {
+            if (grabadora != null) {
+                grabadora.detener();
+                grabadora = null;
+            }
+            ServicioGrabacion.soltar(this);
         }
         detenerVista();
         if (tts != null) {
@@ -802,6 +912,7 @@ public class MainActivity extends Activity {
         boton("Mezclar audio con música de fondo", () -> entrar(this::mzInicio, this::mzManual));
         boton("Crear video con audio e imágenes", () -> entrar(this::vdInicio, this::vdManual));
         boton("Agregar un audio a un video del teléfono", () -> entrar(this::avInicio, this::avManual));
+        boton("Convertir un video en audio", () -> entrar(this::eaInicio, this::eaManual));
         boton("Cambiar la voz de un audio con efectos y ecualizador", () ->
                 entrar(this::vzInicio, this::vzManual));
         boton("Transcribir un audio a texto", () -> entrar(this::trInicio, this::trManual));
@@ -998,6 +1109,10 @@ public class MainActivity extends Activity {
         if (!uno && !varios) return;
         // Se marca como atendido, para no repetirlo si la pantalla se gira o la aplicación se recrea.
         setIntent(new Intent(Intent.ACTION_MAIN));
+        if (grGrabando() || grEmpezando) {
+            aviso("Estás grabando. Cuando termines, vuelve a compartir el archivo.");
+            return;
+        }
         if (bloqueo != null) {
             aviso("Estoy terminando un trabajo. Cuando acabe, vuelve a compartir el archivo.");
             return;
@@ -1077,6 +1192,11 @@ public class MainActivity extends Activity {
                 avUsarVideo(u, nombre, info);
                 aviso("Video elegido: " + nombre);
                 empezar(this::avPasoAudio, this::avManual);
+            });
+            boton("Convertir este video en audio", () -> {
+                eaUsarVideo(u, nombre, info);
+                aviso("Video elegido: " + nombre);
+                empezar(this::eaPasoGuardar, this::eaManual);
             });
             encabezado("Usar solo su sonido");
         } else {
@@ -1196,8 +1316,9 @@ public class MainActivity extends Activity {
         boolean hay = esVoz ? mzVozPcm != null : mzMusPcm != null;
         if (hay) {
             texto((esVoz ? "Audio principal: " : "Música: ")
-                    + (esVoz ? mzVozNombre : mzMusNombre) + ". Dura "
-                    + duracion(esVoz ? mzVozMarcos : mzMusMarcos) + ".");
+                    + (esVoz ? mzVozNombre : mzMusNombre) + ". "
+                    + (esVoz ? "Dura " + duracion(mzVozMarcos) + "."
+                    : textoFragmento(mzFrag, mzMusMarcos)));
         } else {
             texto(esVoz ? "Todavía no elegiste el audio principal." : "Todavía no elegiste la música.");
         }
@@ -1205,6 +1326,7 @@ public class MainActivity extends Activity {
                 ? (hay ? "Cambiar el audio principal" : "Elegir el audio principal")
                 : (hay ? "Cambiar la música" : "Elegir la música");
         boton(etiqueta, () -> mzElegir(esVoz, refrescar));
+        if (!esVoz) mzBloqueFragmento(refrescar);
     }
 
     private void mzElegir(final boolean esVoz, final Runnable refrescar) {
@@ -1225,6 +1347,7 @@ public class MainActivity extends Activity {
                 mzMusNombre = nombre;
                 mzMusPcm = pcm;
                 mzMusMarcos = marcos;
+                mzFrag.nuevo(pcm, marcos);
             }
             alTerminar.run();
         }, atras);
@@ -1576,9 +1699,7 @@ public class MainActivity extends Activity {
         vdAudioPcm = null;
         final File pcm = cache("video_audio.pcm");
         prepararAudio(u, nombre, pcm, marcos -> {
-            vdAudioNombre = nombre;
-            vdAudioPcm = pcm;
-            vdAudioMarcos = marcos;
+            vdFijarAudio(nombre, pcm, marcos);
             empezar(this::vdInicio, this::vdManual);
         }, this::mostrarMenu);
     }
@@ -1588,7 +1709,7 @@ public class MainActivity extends Activity {
     private void vdBloqueAudio(final Runnable refrescar) {
         boolean hay = vdAudioPcm != null;
         if (hay) {
-            texto("Audio: " + vdAudioNombre + ". Dura " + duracion(vdAudioMarcos) + ".");
+            texto("Audio: " + vdAudioNombre + ". " + textoFragmento(vdFrag, vdAudioMarcos));
         } else {
             texto("Todavía no elegiste el audio.");
         }
@@ -1600,9 +1721,7 @@ public class MainActivity extends Activity {
                     vdAudioUri = u;
                     vdAudioPcm = null;
                     prepararAudio(u, nombre, pcm, marcos -> {
-                        vdAudioNombre = nombre;
-                        vdAudioPcm = pcm;
-                        vdAudioMarcos = marcos;
+                        vdFijarAudio(nombre, pcm, marcos);
                         refrescar.run();
                     }, refrescar);
                 }));
@@ -1614,13 +1733,12 @@ public class MainActivity extends Activity {
                 vdAudioPcm = null;
                 final File pcm = cache("video_audio.pcm");
                 prepararAudio(u, nombre, pcm, marcos -> {
-                    vdAudioNombre = nombre;
-                    vdAudioPcm = pcm;
-                    vdAudioMarcos = marcos;
+                    vdFijarAudio(nombre, pcm, marcos);
                     refrescar.run();
                 }, refrescar);
             });
         }
+        vdBloqueFragmento(refrescar);
     }
 
     private void vdBloqueImagenes(final Runnable refrescar) {
@@ -2254,13 +2372,14 @@ public class MainActivity extends Activity {
     private void avBloqueAudio(final Runnable refrescar) {
         boolean hay = avNuevoPcm != null;
         if (hay) {
-            texto("Audio nuevo: " + avNuevoNombre + ". Dura " + duracion(avNuevoMarcos) + ".");
+            texto("Audio nuevo: " + avNuevoNombre + ". " + textoFragmento(avFrag, avNuevoMarcos));
         } else {
             texto("Todavía no elegiste el audio nuevo.");
         }
         boton(hay ? "Cambiar el audio nuevo" : "Elegir el audio nuevo", () ->
                 elegirArchivo(PEDIDO_AUDIO_NUEVO, "audio/*", false, uris ->
                         avCargarAudio(uris.get(0), nombreDe(uris.get(0)), refrescar, refrescar)));
+        avBloqueFragmento(refrescar);
     }
 
     private void avUsarVideo(Uri u, String nombre, Video.Info info) {
@@ -2279,6 +2398,7 @@ public class MainActivity extends Activity {
             avNuevoNombre = nombre;
             avNuevoPcm = pcm;
             avNuevoMarcos = marcos;
+            avFrag.nuevo(pcm, marcos);
             alTerminar.run();
         }, atras);
     }
@@ -2845,13 +2965,24 @@ public class MainActivity extends Activity {
 
     /** Sigue con siguiente si la aplicación ya tiene el permiso del micrófono; si no, lo pide. */
     private void conMicrofono(Runnable siguiente) {
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
-                == PackageManager.PERMISSION_GRANTED) {
+        boolean microfono = checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                == PackageManager.PERMISSION_GRANTED;
+        // El permiso de avisos (Android 13 o más) se pide una sola vez: permite ver el aviso con los
+        // botones Pausar y Terminar mientras la grabación sigue en segundo plano.
+        boolean avisos = Build.VERSION.SDK_INT < 33
+                || checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                == PackageManager.PERMISSION_GRANTED
+                || prefs.getBoolean("avisos_pedidos", false);
+        if (microfono && avisos) {
             siguiente.run();
             return;
         }
         alConcederMicrofono = siguiente;
-        requestPermissions(new String[] {Manifest.permission.RECORD_AUDIO}, PEDIDO_MICROFONO);
+        List<String> pedir = new ArrayList<>();
+        if (!microfono) pedir.add(Manifest.permission.RECORD_AUDIO);
+        if (!avisos) pedir.add(Manifest.permission.POST_NOTIFICATIONS);
+        prefs.edit().putBoolean("avisos_pedidos", true).apply();
+        requestPermissions(pedir.toArray(new String[0]), PEDIDO_MICROFONO);
     }
 
     @Override
@@ -2860,8 +2991,15 @@ public class MainActivity extends Activity {
         if (pedido != PEDIDO_MICROFONO) return;
         Runnable r = alConcederMicrofono;
         alConcederMicrofono = null;
-        if (resultados.length > 0 && resultados[0] == PackageManager.PERMISSION_GRANTED) {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                == PackageManager.PERMISSION_GRANTED) {
             if (r != null) r.run();
+            if (Build.VERSION.SDK_INT >= 33
+                    && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                    != PackageManager.PERMISSION_GRANTED) {
+                aviso("Sin el permiso de notificaciones no verás los botones Pausar y Terminar fuera "
+                        + "de la aplicación, pero la grabación seguirá funcionando.");
+            }
         } else {
             aviso("Sin el permiso del micrófono no puedo grabar. Puedes dárselo a la aplicación en "
                     + "los ajustes del teléfono, en Permisos.");
@@ -2908,6 +3046,7 @@ public class MainActivity extends Activity {
             grMarcos = grabadora.detener();
             grabadora = null;
         }
+        ServicioGrabacion.soltar(this);
         if (motivo != null) aviso(motivo);
         if (grMarcos <= 0) {
             aviso("No se grabó nada.");
@@ -2922,6 +3061,10 @@ public class MainActivity extends Activity {
     /** Los controles para grabar: estado, tiempo, espera, botón principal, terminar y descartar. */
     private void grBloqueGrabacion(final Runnable alTerminar, final Runnable alSalir) {
         final int id = pantallaId;
+        texto("Puedes salir de la aplicación mientras grabas, por ejemplo para grabar un tutorial en "
+                + "otra aplicación: la grabación sigue en segundo plano y la barra de "
+                + "notificaciones muestra un aviso con los botones Pausar y Terminar. Para volver, "
+                + "toca ese aviso.");
         final TextView estado = texto(grTextoEstado());
         estado.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
         final TextView tiempo = texto(grTextoTiempo());
@@ -2941,6 +3084,7 @@ public class MainActivity extends Activity {
             if (grEmpezando) {
                 grEmpezando = false;
                 grTic++;
+                ServicioGrabacion.soltar(this);
                 refrescar.run();
             } else if (grabadora != null && grabadora.estado() == Grabadora.GRABANDO) {
                 grabadora.pausar();
@@ -2985,24 +3129,25 @@ public class MainActivity extends Activity {
                 grabadora.descartar();
                 grabadora = null;
             }
+            ServicioGrabacion.soltar(this);
             grArchivo().delete();
             grMarcos = 0;
             grConfirmaDescartar = false;
             aviso("Grabación descartada.");
             alSalir.run();
         });
-        // Atrás nunca descarta la grabación en silencio: la pausa y avisa.
+        // Atrás nunca descarta la grabación en silencio ni la pausa: solo avisa que sigue.
         volver = () -> {
             if (grabadora != null && grabadora.estado() == Grabadora.GRABANDO) {
-                grabadora.pausar();
-                refrescar.run();
-                aviso("Pausé la grabación. Sigue guardada. Para salir sin guardarla usa "
-                        + "Descartar la grabación.");
+                aviso("La grabación sigue en curso. Para terminarla, toca Terminar y revisar la "
+                        + "grabación. Para grabar en otra aplicación, ve al inicio del teléfono: "
+                        + "la grabación continúa en segundo plano.");
             } else if (grGrabando()) {
                 aviso("Hay una grabación en pausa. Termínala o descártala antes de salir.");
             } else if (grEmpezando) {
                 grEmpezando = false;
                 grTic++;
+                ServicioGrabacion.soltar(this);
                 refrescar.run();
             } else {
                 alSalir.run();
@@ -3016,6 +3161,9 @@ public class MainActivity extends Activity {
         final int espera = GR_CUENTA_SEG[Math.max(0, Math.min(GR_CUENTA_SEG.length - 1, grCuenta))];
         grEmpezando = true;
         final int tic = ++grTic;
+        // El servicio se arranca ahora, con la aplicación a la vista: así la grabación puede empezar
+        // y seguir aunque salgas de la aplicación durante la espera.
+        ServicioGrabacion.iniciar(this);
         refrescar.run();
         contenido.postDelayed(() -> {
             if (tic != grTic || !grEmpezando || id != pantallaId) return;
@@ -3027,15 +3175,51 @@ public class MainActivity extends Activity {
                     Grabadora g = new Grabadora(grArchivo());
                     g.iniciar();
                     grabadora = g;
+                    ServicioGrabacion.grabadora = g;
                     grMarcos = 0;
                     grLatido(id, refrescar, alTerminar);
                 } catch (Exception e) {
                     grabadora = null;
+                    ServicioGrabacion.soltar(this);
                     aviso(textoError(e));
                 }
                 refrescar.run();
             }, 550);
         }, espera * 1000L);
+    }
+
+    /**
+     * Si la grabación siguió en segundo plano mientras Android cerraba la pantalla, vuelve a la
+     * pantalla de grabar (o a la de revisar, si ya terminó).
+     */
+    private void grRecuperar() {
+        Grabadora s = ServicioGrabacion.grabadora;
+        if (s == null || grabadora != null) return;
+        if (s.estado() == Grabadora.DETENIDA) {
+            grMarcos = s.marcos();
+            ServicioGrabacion.soltar(this);
+            if (grMarcos > 0) {
+                aviso("Tu grabación terminó mientras estabas fuera. Está lista para revisarla.");
+                empezar(this::grPasoRevisar, this::grManual);
+            }
+            return;
+        }
+        grabadora = s;
+        aviso("Tu grabación sigue en curso.");
+        if (asistente()) {
+            grPasoGrabar();
+        } else {
+            grManual();
+        }
+        grLatidoRecuperado();
+    }
+
+    /** Vuelve a poner en marcha el reloj de la pantalla de grabar tras recuperarla. */
+    private void grLatidoRecuperado() {
+        final int id = pantallaId;
+        final Runnable alTerminar = () -> empezar(this::grPasoRevisar, this::grManual);
+        final Runnable refrescar = grRefrescarUi;
+        if (refrescar != null) grLatido(id, refrescar, alTerminar);
     }
 
     /** Cada segundo actualiza el tiempo y revisa si la grabación terminó sola o falló. */
@@ -3044,7 +3228,6 @@ public class MainActivity extends Activity {
             @Override
             public void run() {
                 if (id != pantallaId || grabadora == null) return;
-                if (grabadora.estado() == Grabadora.DETENIDA) return;
                 if (grabadora.error() != null) {
                     grTerminar(alTerminar, grabadora.error());
                     return;
@@ -3052,6 +3235,11 @@ public class MainActivity extends Activity {
                 if (grabadora.llegoAlLimite()) {
                     grTerminar(alTerminar, "Llegaste al máximo de 30 minutos y la grabación se "
                             + "detuvo sola.");
+                    return;
+                }
+                if (grabadora.estado() == Grabadora.DETENIDA) {
+                    // Se terminó desde el aviso de la barra de notificaciones.
+                    grTerminar(alTerminar, "La grabación terminó.");
                     return;
                 }
                 refrescar.run();
@@ -3207,9 +3395,12 @@ public class MainActivity extends Activity {
                 + "grabas, el teléfono no debe hablar: si usas un lector de pantalla, usa audífonos "
                 + "o evita tocar la pantalla, porque su voz podría quedar grabada. Al tocar Empezar "
                 + "a grabar hay una espera, que puedes cambiar, y suena un pitido justo cuando "
-                + "empieza la grabación. Puedes grabar hasta 30 minutos. Si sales de la aplicación, "
-                + "la grabación se pausa. La primera vez, Android te pedirá permiso para usar el "
-                + "micrófono.";
+                + "empieza la grabación. Puedes grabar hasta 30 minutos. Puedes salir de la "
+                + "aplicación mientras grabas, por ejemplo para grabar un tutorial en otra "
+                + "aplicación: la grabación sigue en segundo plano y verás un aviso en la barra de "
+                + "notificaciones con los botones Pausar y Terminar. Con una espera de 10 segundos "
+                + "te da tiempo de ir a la otra aplicación. La primera vez, Android te pedirá permiso "
+                + "para usar el micrófono y para mostrar avisos.";
         texto(t);
         guia(t);
         boton("Siguiente: grabar", this::grPasoGrabar);
@@ -3272,6 +3463,427 @@ public class MainActivity extends Activity {
             grBloqueGuardar(this::grManual);
         }
         boton("Volver al menú", () -> volver.run());
+    }
+
+    // =====================================================================
+    // CONVERTIR UN VIDEO EN AUDIO (versión 0.7, sugerencia de Leo, de México)
+    // =====================================================================
+
+    private static String sinExtension(String nombre) {
+        String n = nombre == null ? "" : nombre.trim();
+        int p = n.lastIndexOf('.');
+        if (p > 0 && n.length() - p <= 5) n = n.substring(0, p);
+        return n;
+    }
+
+    private void eaUsarVideo(Uri u, String nombre, Video.Info info) {
+        eaVideoUri = u;
+        eaVideoNombre = nombre;
+        eaInfo = info;
+        String base = sinExtension(nombre);
+        eaNombreSalida = base.isEmpty() ? "Audio del video" : "Audio de " + base;
+    }
+
+    private void eaBloqueVideo(final Runnable refrescar) {
+        boolean hay = eaInfo != null;
+        if (hay) {
+            texto("Video: " + eaVideoNombre + ". Dura " + textoDuracion(Math.round(eaInfo.seg)) + ". "
+                    + (eaInfo.audio ? "Tiene audio."
+                    : "No tiene audio, así que no hay nada que convertir. Elige otro video."));
+        } else {
+            texto("Todavía no elegiste el video.");
+        }
+        boton(hay ? "Cambiar el video" : "Elegir el video", () ->
+                elegirArchivo(PEDIDO_VIDEO, "video/*", false, uris -> {
+                    final Uri u = uris.get(0);
+                    final String nombre = nombreDe(u);
+                    final Video.Info[] info = new Video.Info[1];
+                    trabajar("Revisando el video", "Estoy leyendo los datos de " + nombre + ".",
+                            (p, c) -> info[0] = Video.info(this, u),
+                            () -> {
+                                eaUsarVideo(u, nombre, info[0]);
+                                refrescar.run();
+                            }, refrescar);
+                }));
+    }
+
+    private boolean eaListo() {
+        return eaInfo != null && eaInfo.audio;
+    }
+
+    private void eaBloqueExportar(final Runnable volverAqui) {
+        if (!eaListo()) return;
+        texto("Se guardará solo el sonido del video, sin la imagen. Si el audio del video está en AAC, "
+                + "que es lo normal, y eliges M4A, se copia tal cual: es muy rápido y no pierde "
+                + "calidad. Con otros audios se lee y se vuelve a codificar.");
+        final EditText nombre = campoNombre("Nombre del archivo", eaNombreSalida);
+        ciclo("Formato", new String[] {"M4A, recomendado: pesa poco y suena bien",
+                "WAV, sin compresión: pesa mucho"}, () -> eaFormato, v -> eaFormato = v);
+        boton("Convertir el video en audio", () -> {
+            eaNombreSalida = nombre.getText().toString();
+            eaExportar(volverAqui);
+        });
+    }
+
+    private void eaExportar(final Runnable volverAqui) {
+        final Uri video = eaVideoUri;
+        final boolean wav = eaFormato == 1;
+        final String nombre = nombreArchivo(eaNombreSalida, "Audio del video")
+                + (wav ? ".wav" : ".m4a");
+        final String mime = wav ? "audio/x-wav" : "audio/mp4";
+        final File tmp = cache(wav ? "ea_salida.wav" : "ea_salida.m4a");
+        final File pcm = cache("ea_audio.pcm");
+        final Uri[] resultado = new Uri[1];
+        final boolean[] directo = {false};
+        trabajar("Convirtiendo el video en audio",
+                "Estoy sacando el sonido de tu video. Mantén la aplicación abierta.",
+                (p, c) -> {
+                    try {
+                        tmp.delete();
+                        directo[0] = Audio.extraerAudio(this, video, wav, pcm, tmp, p, c);
+                        resultado[0] = Audio.guardar(this, tmp, nombre, mime, false);
+                        p.porcentaje(100);
+                    } finally {
+                        tmp.delete();
+                        pcm.delete();
+                    }
+                },
+                () -> eaResultado(resultado[0], nombre, mime, directo[0]), volverAqui);
+    }
+
+    private void eaResultado(final Uri uri, String nombre, final String mime, boolean directo) {
+        final String guardado = Audio.nombreGuardado(this, uri, nombre);
+        ultimaMezclaUri = uri;
+        ultimaMezclaNombre = guardado;
+        nuevaPantalla("Audio guardado", this::mostrarMenu);
+        String t = "El audio de tu video se guardó en la carpeta Música, dentro de la carpeta "
+                + Audio.CARPETA + ", con el nombre " + guardado + "."
+                + (directo ? " Se copió sin volver a codificarlo, así que tiene la misma calidad "
+                + "que el original." : "")
+                + " Ya puedes usarlo en las demás funciones.";
+        texto(t);
+        guia("Listo. " + t);
+        boton("Reproducir el audio", () -> abrirArchivo(uri, mime));
+        boton("Compartir el audio", () -> compartir(uri, mime));
+        boton("Mezclarlo con música de fondo", () ->
+                mzCargar(true, uri, guardado,
+                        () -> empezar(this::mzPasoMusica, this::mzManual), this::mostrarMenu));
+        boton("Cambiarle la voz con efectos", () ->
+                vzCargar(uri, guardado, () -> empezar(this::vzPasoEfecto, this::vzManual),
+                        this::mostrarMenu));
+        boton("Transcribirlo a texto", () ->
+                trCargar(uri, guardado, () -> empezar(this::trPasoOpciones, this::trManual),
+                        this::mostrarMenu));
+        boton("Crear un video con este audio y con imágenes", () ->
+                vdUsarAudioExistente(uri, guardado));
+        boton("Convertir otro video", () -> {
+            eaInfo = null;
+            empezar(this::eaPasoVideo, this::eaManual);
+        });
+        boton("Volver al menú", this::mostrarMenu);
+    }
+
+    // ----- Pasos guiados -----
+
+    private void eaInicio() {
+        nuevaPantalla("Convertir un video en audio", this::mostrarMenu);
+        String t = "Vamos a sacar el sonido de un video del teléfono y guardarlo como un archivo de "
+                + "audio. Te guiaré paso a paso: elegir el video y guardar el audio. Después podrás "
+                + "mezclarlo con música, cambiarle la voz, transcribirlo o ponerlo en otro video.";
+        texto(t);
+        guia(t);
+        boton("Comenzar", this::eaPasoVideo);
+        boton("Volver al menú", this::mostrarMenu);
+    }
+
+    private void eaPasoVideo() {
+        nuevaPantalla("Paso 1: el video", this::eaInicio);
+        String t = "Elige el video del que quieres sacar el audio.";
+        texto(t);
+        guia(t);
+        eaBloqueVideo(this::eaPasoVideo);
+        if (eaListo()) boton("Siguiente: guardar el audio", this::eaPasoGuardar);
+        boton("Atrás", this::eaInicio);
+    }
+
+    private void eaPasoGuardar() {
+        nuevaPantalla("Paso 2: guardar el audio", this::eaPasoVideo);
+        String t = "Último paso. Elige el nombre y el formato, y convierte el video en audio.";
+        texto(t);
+        guia(t);
+        eaBloqueExportar(this::eaPasoGuardar);
+        boton("Atrás", this::eaPasoVideo);
+    }
+
+    // ----- Modo manual -----
+
+    private void eaManual() {
+        nuevaPantalla("Convertir video en audio, modo manual", this::mostrarMenu);
+        texto("En modo manual tienes todas las opciones en esta pantalla, sin pasos guiados.");
+        encabezado("Video");
+        eaBloqueVideo(this::eaManual);
+        if (!eaListo()) {
+            texto("Cuando elijas un video con audio, aparecerán los demás ajustes.");
+            boton("Volver al menú", this::mostrarMenu);
+            return;
+        }
+        encabezado("Guardar el audio");
+        eaBloqueExportar(this::eaManual);
+        boton("Volver al menú", this::mostrarMenu);
+    }
+
+    // =====================================================================
+    // USAR SOLO UN FRAGMENTO DE UN AUDIO (versión 0.7, sugerencia de Vivi Beliu, de Argentina)
+    // =====================================================================
+
+    /** Convierte "1:05", "65", "1:02:30" o "0:30,5" en segundos. Devuelve -1 si no se entiende. */
+    private static double leerTiempo(String s) {
+        if (s == null) return -1;
+        String t = s.trim().replace(',', '.');
+        if (t.isEmpty()) return -1;
+        String[] p = t.split(":", -1);
+        if (p.length > 3) return -1;
+        double total = 0;
+        try {
+            for (int i = 0; i < p.length; i++) {
+                String x = p[i].trim();
+                if (x.isEmpty()) return -1;
+                double v = Double.parseDouble(x);
+                if (v < 0 || Double.isNaN(v) || Double.isInfinite(v)) return -1;
+                if (i > 0 && v >= 60) return -1;
+                total = total * 60 + v;
+            }
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+        return total;
+    }
+
+    /** Un tiempo en segundos como minutos y segundos, por ejemplo 1:05. */
+    private static String formatoTiempo(long marcos) {
+        long seg = marcos / Audio.HZ;
+        long h = seg / 3600;
+        long m = (seg % 3600) / 60;
+        long s = seg % 60;
+        if (h > 0) return h + ":" + String.format(Locale.US, "%02d:%02d", m, s);
+        return m + ":" + String.format(Locale.US, "%02d", s);
+    }
+
+    /** Lo que se dice de la duración de un audio, con o sin fragmento. */
+    private static String textoFragmento(Frag f, long usados) {
+        if (f.activo()) {
+            return "Usas un fragmento de " + duracion(usados) + ", de un audio que dura "
+                    + duracion(f.marcos) + ".";
+        }
+        return "Dura " + duracion(usados) + ".";
+    }
+
+    /**
+     * Lee los dos cuadros de tiempo. Devuelve {inicio, fin} en marcos, o null si hay algo mal, y en
+     * ese caso lo explica en estado.
+     */
+    private long[] leerFragmento(Frag f, String sDesde, String sHasta, TextView estado) {
+        double desde = 0;
+        if (sDesde != null && !sDesde.trim().isEmpty()) {
+            desde = leerTiempo(sDesde);
+            if (desde < 0) {
+                estado.setText("No entendí el tiempo " + sDesde.trim() + ". Escríbelo como minutos y "
+                        + "segundos, por ejemplo 1:05.");
+                return null;
+            }
+        }
+        double total = f.marcos / (double) Audio.HZ;
+        double hasta = total;
+        if (sHasta != null && !sHasta.trim().isEmpty()) {
+            hasta = leerTiempo(sHasta);
+            if (hasta < 0) {
+                estado.setText("No entendí el tiempo " + sHasta.trim() + ". Escríbelo como minutos y "
+                        + "segundos, por ejemplo 1:35, o déjalo vacío para llegar al final.");
+                return null;
+            }
+        }
+        if (hasta > total) hasta = total;
+        if (desde >= total) {
+            estado.setText("El audio dura " + textoDuracion(Math.round(total)) + ", así que no puede "
+                    + "empezar en " + sDesde.trim() + ".");
+            return null;
+        }
+        if (hasta - desde < 1) {
+            estado.setText("El fragmento tiene que durar al menos un segundo. Revisa que el final "
+                    + "sea mayor que el inicio.");
+            return null;
+        }
+        return new long[] {Math.round(desde * Audio.HZ), Math.round(hasta * Audio.HZ)};
+    }
+
+    /**
+     * Los controles para usar solo un fragmento de un audio, por ejemplo el estribillo de una
+     * canción. El audio entero está en f.completo y el fragmento se guarda en destino. Cuando cambia
+     * el audio que se usa, se avisa con alCambiar (archivo y marcos) y se vuelve a dibujar la pantalla
+     * con refrescar.
+     */
+    private void bloqueFragmento(final String que, final Frag f, final File destino,
+            final BiConsumer<File, Long> alCambiar, final Runnable refrescar) {
+        if (f.completo == null || f.marcos <= 0) return;
+        encabezado("Usar solo un fragmento");
+        texto("Si " + que + " tiene una introducción larga u otras partes que no quieres, puedes usar "
+                + "solo un fragmento, por ejemplo el estribillo de una canción. Escribe dónde empieza "
+                + "y dónde termina, en minutos y segundos, como 1:05. Si dejas el final vacío, se usa "
+                + "hasta el final del audio. Con Escuchar el fragmento compruebas el inicio, y con "
+                + "Escuchar el final del fragmento compruebas dónde termina.");
+        final TextView estado = texto(f.activo()
+                ? "Usas el fragmento que va de " + formatoTiempo(f.ini) + " a "
+                + formatoTiempo(f.fin > 0 ? f.fin : f.marcos) + ". El audio entero dura "
+                + duracion(f.marcos) + "."
+                : "Usas el audio entero, que dura " + duracion(f.marcos) + ".");
+        estado.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        final EditText desde = campoNombre("Desde (minutos:segundos, por ejemplo 1:05)",
+                f.activo() ? formatoTiempo(f.ini) : f.textoIni);
+        final EditText hasta = campoNombre("Hasta (minutos:segundos, vacío para llegar al final)",
+                f.activo() ? (f.fin > 0 && f.fin < f.marcos ? formatoTiempo(f.fin) : "") : f.textoFin);
+        boton("Escuchar el fragmento", () -> {
+            long[] r = leerFragmento(f, desde.getText().toString(), hasta.getText().toString(), estado);
+            if (r != null) fragEscuchar(f, estado, r[0], r[1], false);
+        });
+        boton("Escuchar el final del fragmento", () -> {
+            long[] r = leerFragmento(f, desde.getText().toString(), hasta.getText().toString(), estado);
+            if (r != null) fragEscuchar(f, estado, r[0], r[1], true);
+        });
+        boton("Usar este fragmento", () -> {
+            long[] r = leerFragmento(f, desde.getText().toString(), hasta.getText().toString(), estado);
+            if (r == null) return;
+            f.textoIni = desde.getText().toString();
+            f.textoFin = hasta.getText().toString();
+            final long ini = r[0];
+            final long fin = r[1];
+            if (ini <= 0 && fin >= f.marcos) {
+                f.ini = 0;
+                f.fin = 0;
+                alCambiar.accept(f.completo, f.marcos);
+                aviso("Usas el audio entero.");
+                refrescar.run();
+                return;
+            }
+            trabajar("Preparando el fragmento",
+                    "Estoy cortando el fragmento del audio. Mantén la aplicación abierta.",
+                    (p, c) -> Audio.recortarPcm(f.completo, destino, ini, fin, p, c),
+                    () -> {
+                        f.ini = ini;
+                        f.fin = fin;
+                        alCambiar.accept(destino, fin - ini);
+                        refrescar.run();
+                        String m = "Listo. Ahora usas el fragmento de " + formatoTiempo(ini) + " a "
+                                + formatoTiempo(fin) + ", que dura " + duracion(fin - ini) + ".";
+                        aviso(m);
+                        guia(m);
+                    }, refrescar);
+        });
+        if (f.activo()) {
+            boton("Volver a usar el audio entero", () -> {
+                f.ini = 0;
+                f.fin = 0;
+                f.textoIni = "";
+                f.textoFin = "";
+                alCambiar.accept(f.completo, f.marcos);
+                aviso("Ahora usas el audio entero.");
+                refrescar.run();
+            });
+        }
+    }
+
+    /** Reproduce hasta 20 segundos del fragmento, desde el principio o los últimos 10 segundos. */
+    private void fragEscuchar(final Frag f, final TextView estado, final long ini, final long fin,
+            final boolean final10) {
+        detenerVista();
+        if (tts != null) tts.stop();
+        final int id = pantallaId;
+        final long largo = fin - ini;
+        final long desde = final10 ? Math.max(ini, fin - 10L * Audio.HZ) : ini;
+        final long hasta = Math.min(fin, desde + (final10 ? 10L : 20L) * Audio.HZ);
+        estado.setText("Preparando el fragmento.");
+        new Thread(() -> {
+            short[] datos = null;
+            String error = null;
+            try {
+                int seg = (int) Math.max(1, (hasta - desde + Audio.HZ - 1) / Audio.HZ);
+                short[] t = Audio.tramo(f.completo, desde, seg);
+                int n = (int) Math.min(t.length / 2, hasta - desde);
+                datos = Arrays.copyOf(t, 2 * Math.max(0, n));
+            } catch (Throwable e) {
+                error = textoError(e);
+            }
+            final short[] d = datos;
+            final String falla = error;
+            runOnUiThread(() -> {
+                if (id != pantallaId) return;
+                if (falla != null) {
+                    estado.setText(falla);
+                    return;
+                }
+                estado.setText(final10 ? "Escuchando el final del fragmento."
+                        : "Escuchando el inicio del fragmento. El fragmento dura " + duracion(largo)
+                        + (largo > 20L * Audio.HZ ? " y escuchas los primeros 20 segundos." : "."));
+                reproducir(d, () -> {
+                    if (id != pantallaId) return;
+                    estado.setText("Terminó. El fragmento va de " + formatoTiempo(ini) + " a "
+                            + formatoTiempo(fin) + " y dura " + duracion(largo) + ".");
+                });
+            });
+        }).start();
+    }
+
+    /** Pone el audio del video con imágenes y reinicia su fragmento. */
+    private void vdFijarAudio(String nombre, File pcm, long marcos) {
+        vdAudioNombre = nombre;
+        vdAudioPcm = pcm;
+        vdAudioMarcos = marcos;
+        vdFrag.nuevo(pcm, marcos);
+    }
+
+    private void vdBloqueFragmento(final Runnable refrescar) {
+        if (vdAudioPcm == null) return;
+        bloqueFragmento("el audio", vdFrag, cache("video_audio_frag.pcm"), (archivo, marcos) -> {
+            vdAudioPcm = archivo;
+            vdAudioMarcos = marcos;
+        }, refrescar);
+    }
+
+    private void mzBloqueFragmento(final Runnable refrescar) {
+        if (mzMusPcm == null) return;
+        bloqueFragmento("la música", mzFrag, cache("mezcla_musica_frag.pcm"), (archivo, marcos) -> {
+            mzMusPcm = archivo;
+            mzMusMarcos = marcos;
+        }, refrescar);
+    }
+
+    private void avBloqueFragmento(final Runnable refrescar) {
+        if (avNuevoPcm == null) return;
+        bloqueFragmento("el audio nuevo", avFrag, cache("av_nuevo_frag.pcm"), (archivo, marcos) -> {
+            avNuevoPcm = archivo;
+            avNuevoMarcos = marcos;
+        }, refrescar);
+    }
+
+    /** Aplica a un audio recién abierto el fragmento guardado en un proyecto. */
+    private void vdFragmentoDeProyecto(double iniSeg, double finSeg, final Runnable luego) {
+        final long total = vdFrag.marcos;
+        final long ini = Math.max(0, Math.round(iniSeg * Audio.HZ));
+        final long fin = finSeg > 0 ? Math.min(total, Math.round(finSeg * Audio.HZ)) : total;
+        if (total <= 0 || ini >= total || fin - ini < Audio.HZ || (ini <= 0 && fin >= total)) {
+            luego.run();
+            return;
+        }
+        final File destino = cache("video_audio_frag.pcm");
+        trabajar("Preparando el fragmento",
+                "Estoy cortando el fragmento del audio del proyecto. Mantén la aplicación abierta.",
+                (p, c) -> Audio.recortarPcm(vdFrag.completo, destino, ini, fin, p, c),
+                () -> {
+                    vdFrag.ini = ini;
+                    vdFrag.fin = fin;
+                    vdAudioPcm = destino;
+                    vdAudioMarcos = fin - ini;
+                    luego.run();
+                }, luego);
     }
 
     // =====================================================================
@@ -3673,6 +4285,8 @@ public class MainActivity extends Activity {
             j.put("version", 1);
             j.put("audioUri", vdAudioPcm != null && vdAudioUri != null ? vdAudioUri.toString() : "");
             j.put("audioNombre", vdAudioNombre == null ? "" : vdAudioNombre);
+            j.put("fragIni", vdAudioPcm != null && vdFrag.activo() ? vdFrag.ini / (double) Audio.HZ : 0);
+            j.put("fragFin", vdAudioPcm != null && vdFrag.activo() ? vdFrag.fin / (double) Audio.HZ : 0);
             j.put("formato", vdFormato);
             j.put("encuadre", vdEncuadre);
             j.put("personal", vdPersonal);
@@ -3780,16 +4394,17 @@ public class MainActivity extends Activity {
             vdAudioPcm = null;
             final String audioTxt = j.optString("audioUri", "");
             final String audioNombre = j.optString("audioNombre", "audio");
+            final double fragIni = j.optDouble("fragIni", 0);
+            final double fragFin = j.optDouble("fragFin", 0);
             Uri audio = audioTxt.isEmpty() ? null : Uri.parse(audioTxt);
             if (audio != null && legible(audio)) {
                 final Uri audioUri = audio;
                 final File pcm = cache("video_audio.pcm");
                 vdAudioUri = audioUri;
                 prepararAudio(audioUri, audioNombre, pcm, marcos -> {
-                    vdAudioNombre = audioNombre;
-                    vdAudioPcm = pcm;
-                    vdAudioMarcos = marcos;
-                    proyectoAbierto(nombre, faltan[0], false);
+                    vdFijarAudio(audioNombre, pcm, marcos);
+                    vdFragmentoDeProyecto(fragIni, fragFin,
+                            () -> proyectoAbierto(nombre, faltan[0], false));
                 }, this::mostrarMenu);
             } else {
                 proyectoAbierto(nombre, faltan[0], true);

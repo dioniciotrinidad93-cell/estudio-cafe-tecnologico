@@ -1225,6 +1225,169 @@ final class Audio {
         }
     }
 
+    // ---------- Fragmento de un audio (sugerencia de Vivi Beliu, de Argentina) ----------
+
+    /**
+     * Copia el tramo [desde, hasta) de un audio de trabajo a otro archivo, para usar solo esa parte,
+     * por ejemplo el estribillo de una canción. El archivo de origen no se cambia.
+     */
+    static void recortarPcm(File entrada, File salida, long desde, long hasta, Progreso prog,
+            Cancelado can) throws Exception {
+        long total = entrada.length() / BYTES_MARCO;
+        long d = Math.max(0, Math.min(desde, total));
+        long h = Math.max(d, Math.min(hasta, total));
+        if (h <= d) throw new Exception("El fragmento no tiene nada de audio.");
+        salida.delete();
+        try (RandomAccessFile in = new RandomAccessFile(entrada, "r");
+                OutputStream os = new BufferedOutputStream(new FileOutputStream(salida), 1 << 16)) {
+            in.seek(d * BYTES_MARCO);
+            byte[] buf = new byte[1 << 16];
+            long faltan = (h - d) * BYTES_MARCO;
+            final long todo = faltan;
+            int ultimoPct = -1;
+            while (faltan > 0) {
+                if (can != null && can.si()) throw new Cancelacion();
+                int n = in.read(buf, 0, (int) Math.min(buf.length, faltan));
+                if (n <= 0) break;
+                os.write(buf, 0, n);
+                faltan -= n;
+                if (prog != null) {
+                    int pct = (int) Math.min(99, (todo - faltan) * 100 / todo);
+                    if (pct != ultimoPct) {
+                        ultimoPct = pct;
+                        prog.porcentaje(pct);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            salida.delete();
+            throw e;
+        }
+        if (prog != null) prog.porcentaje(100);
+    }
+
+    // ---------- Convertir un video en audio (sugerencia de Leo, de México) ----------
+
+    /**
+     * Saca el sonido de un video del teléfono y lo guarda como M4A o WAV en destino. Si el video
+     * lleva el audio en AAC (lo normal) y se pide M4A, se copia tal cual, sin volver a codificarlo:
+     * es muy rápido y no pierde calidad. Con cualquier otro audio se lee y se vuelve a codificar.
+     * pcmTemporal es un archivo de trabajo que se usa en ese segundo caso. Devuelve true si el audio
+     * se copió sin recodificar.
+     */
+    static boolean extraerAudio(Context c, Uri video, boolean wav, File pcmTemporal, File destino,
+            Progreso prog, Cancelado can) throws Exception {
+        if (!wav) {
+            boolean listo = false;
+            try {
+                listo = copiarAac(c, video, destino, prog, can);
+            } catch (Cancelacion e) {
+                destino.delete();
+                throw e;
+            } catch (Exception e) {
+                listo = false;
+            }
+            if (listo) return true;
+            destino.delete();
+        }
+        pcmTemporal.delete();
+        decodificar(c, video, pcmTemporal, escalarProgreso(prog, 0, 70), can);
+        if (wav) pcmAWav(pcmTemporal, destino, escalarProgreso(prog, 70, 100), can);
+        else pcmAM4a(pcmTemporal, destino, escalarProgreso(prog, 70, 100), can);
+        pcmTemporal.delete();
+        return false;
+    }
+
+    private static Progreso escalarProgreso(final Progreso p, final int ini, final int fin) {
+        if (p == null) return null;
+        return v -> p.porcentaje(ini + v * (fin - ini) / 100);
+    }
+
+    /** Copia la pista de audio AAC de un video a un M4A. Devuelve false si el audio no es AAC. */
+    private static boolean copiarAac(Context c, Uri uri, File destino, Progreso prog, Cancelado can)
+            throws Exception {
+        MediaExtractor ex = new MediaExtractor();
+        MediaMuxer mx = null;
+        boolean iniciado = false;
+        boolean ok = false;
+        try {
+            ex.setDataSource(c, uri, null);
+            int pista = -1;
+            MediaFormat fmt = null;
+            for (int i = 0; i < ex.getTrackCount(); i++) {
+                MediaFormat f = ex.getTrackFormat(i);
+                String m = f.getString(MediaFormat.KEY_MIME);
+                if (m != null && m.startsWith("audio/")) {
+                    pista = i;
+                    fmt = f;
+                    break;
+                }
+            }
+            if (pista < 0 || fmt == null
+                    || !MediaFormat.MIMETYPE_AUDIO_AAC.equals(fmt.getString(MediaFormat.KEY_MIME))) {
+                return false;
+            }
+            ex.selectTrack(pista);
+            long durUs = fmt.containsKey(MediaFormat.KEY_DURATION)
+                    ? fmt.getLong(MediaFormat.KEY_DURATION) : 0;
+            destino.delete();
+            mx = new MediaMuxer(destino.getAbsolutePath(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+            int pm = mx.addTrack(fmt);
+            mx.start();
+            iniciado = true;
+            ByteBuffer buf = ByteBuffer.allocate(1 << 20);
+            MediaCodec.BufferInfo bi = new MediaCodec.BufferInfo();
+            long base = -1;
+            long escritas = 0;
+            int ultimoPct = -1;
+            while (true) {
+                if (can != null && can.si()) throw new Cancelacion();
+                buf.clear();
+                int n = ex.readSampleData(buf, 0);
+                if (n < 0) break;
+                long t = ex.getSampleTime();
+                if (t < 0) break;
+                if (base < 0) base = t;
+                bi.offset = 0;
+                bi.size = n;
+                bi.presentationTimeUs = t - base;
+                bi.flags = (ex.getSampleFlags() & MediaExtractor.SAMPLE_FLAG_SYNC) != 0
+                        ? MediaCodec.BUFFER_FLAG_KEY_FRAME : 0;
+                mx.writeSampleData(pm, buf, bi);
+                escritas++;
+                ex.advance();
+                if (prog != null && durUs > 0) {
+                    int pct = (int) Math.min(99, (t - base) * 100 / durUs);
+                    if (pct != ultimoPct) {
+                        ultimoPct = pct;
+                        prog.porcentaje(pct);
+                    }
+                }
+            }
+            ok = escritas > 0;
+        } finally {
+            try {
+                ex.release();
+            } catch (Exception ignorada) {
+                // nada
+            }
+            if (mx != null) {
+                try {
+                    if (iniciado) mx.stop();
+                } catch (Exception e) {
+                    ok = false;
+                }
+                try {
+                    mx.release();
+                } catch (Exception ignorada) {
+                    // nada
+                }
+            }
+        }
+        if (ok && prog != null) prog.porcentaje(100);
+        return ok;
+    }
+
     // ---------- Guardar en el teléfono ----------
 
     static final String CARPETA = "Estudio Cafe Tecnologico";

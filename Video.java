@@ -762,8 +762,12 @@ final class Video {
     /**
      * Crea el video. audioM4a es el audio ya codificado; durSeg trae la duración de cada imagen
      * en segundos; totalSeg es lo que dura el audio (y el video). Si hay zoom, destello, transiciones
-     * visuales o texto animado, el video se crea a más cuadros por segundo. Mientras una imagen está
-     * quieta se envían pocos cuadros, para que el video no tarde de más.
+     * visuales o texto animado, el video se crea a más cuadros por segundo. Cada cuadro se envía al
+     * codificador, también cuando la imagen está quieta, para que el video tenga siempre el mismo
+     * ritmo de cuadros. En la versión 0.5 las imágenes quietas enviaban solo uno de cada cuatro
+     * cuadros y el video quedaba con ritmo variable; un reporte de Karime (imágenes quietas en
+     * negro) llevó a volver al envío completo de la versión 0.4. Como el cuadro quieto ya está
+     * calculado, repetirlo cuesta muy poco.
      *
      * transVis es la transición visual entre imágenes (0 ninguna) y transDur su duración (0 a 2). La
      * transición empieza en el momento exacto en que cambia la imagen, igual que el sonido y el
@@ -780,7 +784,6 @@ final class Video {
         final boolean conAnimTexto = hayAnimTexto(imagenes);
         final boolean conMov = conZoom || conFlash || conTransVis || conAnimTexto;
         final int fps = conMov ? FPS_ZOOM : FPS;
-        final int paso = Math.max(1, fps / FPS);
         final float picoFlash = PICO_FLASH[limitar(flash, 0, PICO_FLASH.length - 1)];
         final int cuadrosTrans = (int) Math.round(
                 SEG_TRANSICION[limitar(transDur, 0, SEG_TRANSICION.length - 1)] * fps);
@@ -904,7 +907,6 @@ final class Video {
                                 && (rel < ventAnim[0] || cuadroActual >= inicioSalida);
                         final boolean enTrans = rel < nTr;
                         final boolean enFlash = rel < nFlash;
-                        long salto = 1;
                         if (zoomea || animaTexto || enTrans || enFlash) {
                             baseLista = false;
                             float z = 1f;
@@ -932,13 +934,8 @@ final class Video {
                                 aYuv(cuadro, w, h, px, yy, uu, vv);
                                 baseLista = true;
                             }
-                            // Imagen quieta: basta con pocos cuadros por segundo, pero sin pasarse
-                            // del momento en que empieza la salida del texto.
-                            long limite = fin - cuadroActual;
-                            if (inicioSalida != Long.MAX_VALUE && inicioSalida > cuadroActual) {
-                                limite = Math.min(limite, inicioSalida - cuadroActual);
-                            }
-                            salto = Math.max(1, Math.min(paso, limite));
+                            // Imagen quieta: el cuadro ya está calculado y se envía tal cual, uno por
+                            // cada cuadro del video, sin saltarse ninguno.
                         }
                         Image im2 = enc.getInputImage(i);
                         if (im2 == null) {
@@ -949,11 +946,11 @@ final class Video {
                         copiarPlano(pl[0], yy, w, h);
                         copiarPlano(pl[1], uu, w / 2, h / 2);
                         copiarPlano(pl[2], vv, w / 2, h / 2);
-                        boolean ultimo = cuadroActual + salto >= totalMarcos;
+                        boolean ultimo = cuadroActual + 1 >= totalMarcos;
                         enc.queueInputBuffer(i, 0, w * h * 3 / 2,
                                 cuadroActual * 1000000L / fps,
                                 ultimo ? MediaCodec.BUFFER_FLAG_END_OF_STREAM : 0);
-                        cuadroActual += salto;
+                        cuadroActual++;
                     }
                     if (!eos && drenar(enc, mx, est, bi, 0)) eos = true;
                     if (prog != null) {
